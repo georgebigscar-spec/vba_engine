@@ -491,11 +491,16 @@ impl Parser {
             name.push('.');
             name.push_str(&self.member_name()?);
         }
-        // `String * 10` fixed-length strings: length is ignored for now.
-        if self.eat_op("*") {
-            self.parse_primary()?;
-        }
-        Ok(TypeName { name, is_new })
+        let fixed_len = if self.eat_op("*") {
+            Some(Box::new(self.parse_primary()?))
+        } else {
+            None
+        };
+        Ok(TypeName {
+            name,
+            is_new,
+            fixed_len,
+        })
     }
 
     fn parse_var_decls(&mut self) -> PResult<Vec<VarDecl>> {
@@ -602,6 +607,9 @@ impl Parser {
         if self.is_ident("Static") {
             self.bump();
             return Ok(StmtKind::Dim(self.parse_var_decls()?));
+        }
+        if let Some(kind) = self.parse_file_statement()? {
+            return Ok(kind);
         }
         if self.is_ident("RaiseEvent") && matches!(self.peek_at(1), Tok::Ident(_)) {
             self.bump();
@@ -749,6 +757,135 @@ impl Parser {
         }
     }
 
+    /// `#1` or `1` where a file number is expected.
+    fn parse_file_number(&mut self) -> PResult<Expr> {
+        self.eat_op("#");
+        self.parse_expr()
+    }
+
+    /// Items after `Print #1,` / `Write #1,`.
+    fn parse_print_items(&mut self) -> PResult<Vec<PrintItem>> {
+        let mut items = Vec::new();
+        while !self.at_stmt_end() {
+            items.push(if self.eat_op(";") {
+                PrintItem::Semicolon
+            } else if self.eat_op(",") {
+                PrintItem::Comma
+            } else {
+                PrintItem::Expr(self.parse_expr()?)
+            });
+        }
+        Ok(items)
+    }
+
+    /// File I/O and other statements that start with a plain word: `Open`,
+    /// `Close`, `Print #`, `Write #`, `Line Input #`, `Input #`, `Erase`,
+    /// `LSet`, `RSet`.
+    fn parse_file_statement(&mut self) -> PResult<Option<StmtKind>> {
+        let Tok::Ident(word) = self.peek().clone() else {
+            return Ok(None);
+        };
+        let next = self.peek_at(1).clone();
+        let hash_next = matches!(next, Tok::Op("#"));
+        let kind = match word.to_ascii_lowercase().as_str() {
+            "open" if !matches!(next, Tok::Op("=" | "." | "(") | Tok::Newline | Tok::Eof) => {
+                self.bump();
+                let path = self.parse_expr()?;
+                self.expect_kw(Kw::For)?;
+                let mode = match self.bump() {
+                    Tok::Ident(m) => match m.to_ascii_lowercase().as_str() {
+                        "input" => OpenMode::Input,
+                        "output" => OpenMode::Output,
+                        "append" => OpenMode::Append,
+                        "binary" => OpenMode::Binary,
+                        "random" => OpenMode::Random,
+                        _ => return self.err(format!("unknown file mode {m}")),
+                    },
+                    other => {
+                        return self.err(format!("expected file mode, found {}", describe(&other)))
+                    }
+                };
+                // `Access Read Write` / `Lock Shared` are accepted and ignored.
+                while !self.is_kw(Kw::As) && !self.at_stmt_end() {
+                    self.bump();
+                }
+                self.expect_kw(Kw::As)?;
+                let file = self.parse_file_number()?;
+                if self.is_ident("Len") {
+                    self.bump();
+                    self.expect_op("=")?;
+                    self.parse_expr()?;
+                }
+                StmtKind::Open { path, mode, file }
+            }
+            "close"
+                if hash_next
+                    || matches!(
+                        next,
+                        Tok::Newline | Tok::Eof | Tok::Op(":") | Tok::Int(_) | Tok::Ident(_)
+                    ) =>
+            {
+                self.bump();
+                let mut files = Vec::new();
+                while !self.at_stmt_end() {
+                    files.push(self.parse_file_number()?);
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+                StmtKind::Close(files)
+            }
+            "print" | "write" if hash_next => {
+                self.bump();
+                let file = self.parse_file_number()?;
+                self.eat_op(",");
+                let items = self.parse_print_items()?;
+                if word.eq_ignore_ascii_case("print") {
+                    StmtKind::PrintFile { file, items }
+                } else {
+                    StmtKind::WriteFile { file, items }
+                }
+            }
+            "line" if matches!(&next, Tok::Ident(w) if w.eq_ignore_ascii_case("input")) => {
+                self.pos += 2;
+                let file = self.parse_file_number()?;
+                self.expect_op(",")?;
+                let target = self.parse_postfix()?;
+                StmtKind::LineInput { file, target }
+            }
+            "input" if hash_next => {
+                self.bump();
+                let file = self.parse_file_number()?;
+                self.expect_op(",")?;
+                let mut targets = vec![self.parse_postfix()?];
+                while self.eat_op(",") {
+                    targets.push(self.parse_postfix()?);
+                }
+                StmtKind::InputFile { file, targets }
+            }
+            "erase" if matches!(next, Tok::Ident(_)) => {
+                self.bump();
+                let mut targets = vec![self.parse_postfix()?];
+                while self.eat_op(",") {
+                    targets.push(self.parse_postfix()?);
+                }
+                StmtKind::Erase(targets)
+            }
+            "lset" | "rset" if matches!(next, Tok::Ident(_)) => {
+                self.bump();
+                let target = self.parse_postfix()?;
+                self.expect_op("=")?;
+                StmtKind::AlignSet {
+                    right: word.eq_ignore_ascii_case("rset"),
+                    target,
+                    value: self.parse_expr()?,
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(kind))
+    }
+
     /// Assignment or call statement starting with an expression.
     fn parse_simple_statement(&mut self) -> PResult<StmtKind> {
         if self.is_ident("debug")
@@ -770,10 +907,23 @@ impl Parser {
         }
         let target = self.parse_postfix()?;
         if self.eat_op("=") {
-            return Ok(StmtKind::Assign {
-                target,
-                value: self.parse_expr()?,
-            });
+            let value = self.parse_expr()?;
+            // `Mid(s, 2, 3) = "abc"` replaces characters in place.
+            if let Expr::Index(callee, args) = &target {
+                if matches!(&**callee, Expr::Ident(n) if n.eq_ignore_ascii_case("mid"))
+                    && (2..=3).contains(&args.len())
+                    && args.iter().all(|a| a.name.is_none() && a.value.is_some())
+                {
+                    let mut args = args.iter().map(|a| a.value.clone().unwrap());
+                    return Ok(StmtKind::MidAssign {
+                        target: args.next().unwrap(),
+                        start: args.next().unwrap(),
+                        length: args.next(),
+                        value,
+                    });
+                }
+            }
+            return Ok(StmtKind::Assign { target, value });
         }
         if self.at_stmt_end() {
             return Ok(match target {

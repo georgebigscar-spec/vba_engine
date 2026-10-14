@@ -118,6 +118,8 @@ pub struct Param {
 pub struct TypeName {
     pub name: String,
     pub is_new: bool,
+    /// `String * 10`: the length of a fixed-length string.
+    pub fixed_len: Option<Box<Expr>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -215,6 +217,58 @@ pub enum StmtKind {
         name: String,
         args: Vec<Arg>,
     },
+    /// `Open path For Input As #1`
+    Open {
+        path: Expr,
+        mode: OpenMode,
+        file: Expr,
+    },
+    /// `Close #1, #2`; no files closes all.
+    Close(Vec<Expr>),
+    /// `Print #1, a; b` — same separators as `Debug.Print`.
+    PrintFile {
+        file: Expr,
+        items: Vec<PrintItem>,
+    },
+    /// `Write #1, a, b` — comma-delimited, strings quoted.
+    WriteFile {
+        file: Expr,
+        items: Vec<PrintItem>,
+    },
+    /// `Line Input #1, s`
+    LineInput {
+        file: Expr,
+        target: Expr,
+    },
+    /// `Input #1, a, b`
+    InputFile {
+        file: Expr,
+        targets: Vec<Expr>,
+    },
+    /// `Erase a, b`
+    Erase(Vec<Expr>),
+    /// `LSet s = v` / `RSet s = v`: align within the string's current length.
+    AlignSet {
+        right: bool,
+        target: Expr,
+        value: Expr,
+    },
+    /// `Mid(s, start[, length]) = v`
+    MidAssign {
+        target: Expr,
+        start: Expr,
+        length: Option<Expr>,
+        value: Expr,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    Input,
+    Output,
+    Append,
+    Binary,
+    Random,
 }
 
 #[derive(Debug, Clone, PartialEq)]
