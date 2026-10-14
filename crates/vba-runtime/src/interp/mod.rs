@@ -215,7 +215,7 @@ impl Interpreter {
                     Some(expr) => VarType::Long.coerce(self.eval(expr)?)?,
                     None => next.clone(),
                 };
-                next = value::add(&v, &Value::Long(1))?;
+                next = value::add(&v, &Value::Long(1), false)?;
                 let s = slot(v.clone(), VarType::Long);
                 s.borrow_mut().is_const = true;
                 self.globals.push(Global {
@@ -885,7 +885,7 @@ impl Interpreter {
                         other => return Ok(other),
                     }
                     let mut c = counter.borrow_mut();
-                    let next = value::add(&c.value, &step)?;
+                    let next = value::add(&c.value, &step, false)?;
                     c.value = c.ty.coerce(next)?;
                 }
             }
@@ -1985,21 +1985,28 @@ impl Interpreter {
             }
             Expr::Index(callee, args) => self.eval_call(callee, args, Invoke::Get)?,
             Expr::Unary(UnOp::Neg, a) => {
+                let strict = self.static_type(a).is_some();
                 let v = self.eval(a)?;
-                value::neg(&self.scalar(v)?)?
+                value::neg(&self.scalar(v)?, strict)?
             }
             Expr::Unary(UnOp::Not, a) => {
                 let v = self.eval(a)?;
                 value::not(&self.scalar(v)?)?
             }
             Expr::Binary(op, a, b) => {
+                let fixed = match op {
+                    BinOp::Concat | BinOp::Like | BinOp::Is | BinOp::Pow => (false, false),
+                    _ => (self.static_type(a).is_some(), self.static_type(b).is_some()),
+                };
                 let (a, b) = (self.eval(a)?, self.eval(b)?);
-                self.binary(*op, a, b)?
+                self.binary(*op, a, b, fixed)?
             }
         })
     }
 
-    fn binary(&mut self, op: BinOp, a: Value, b: Value) -> VbaResult<Value> {
+    /// `fixed` says which operands have a fixed static type (see
+    /// [`Self::static_type`]).
+    fn binary(&mut self, op: BinOp, a: Value, b: Value, fixed: (bool, bool)) -> VbaResult<Value> {
         if op == BinOp::Is {
             return Ok(Value::Boolean(match (&a, &b) {
                 (Value::Object(None), Value::Object(None)) => true,
@@ -2009,39 +2016,94 @@ impl Interpreter {
             }));
         }
         let (a, b) = (self.scalar(a)?, self.scalar(b)?);
-        let text = self.text_compare();
-        Ok(match op {
-            BinOp::Add => value::add(&a, &b)?,
-            BinOp::Sub => value::sub(&a, &b)?,
-            BinOp::Mul => value::mul(&a, &b)?,
-            BinOp::Div => value::div(&a, &b)?,
-            BinOp::IntDiv => value::int_div(&a, &b)?,
-            BinOp::Mod => value::modulo(&a, &b)?,
-            BinOp::Pow => value::pow(&a, &b)?,
-            BinOp::Concat => value::concat(&a, &b)?,
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                match value::compare(&a, &b, text)? {
-                    None => Value::Null,
-                    ord => Value::Boolean(compare_op(op, ord)),
-                }
+        apply_binary(op, &a, &b, self.text_compare(), fixed)
+    }
+
+    /// The static type VBA's compiler gives an expression, which decides
+    /// whether arithmetic overflows or widens: `None` for a Variant (untyped
+    /// variables and functions, Null, Empty, object members), else the type of
+    /// a literal, a typed variable or constant, a typed function result or an
+    /// operator applied to typed operands.
+    fn static_type(&self, e: &Expr) -> Option<VarType> {
+        match e {
+            Expr::Int(v) => Some(match *v {
+                v if (i16::MIN as i64..=i16::MAX as i64).contains(&v) => VarType::Integer,
+                v if (i32::MIN as i64..=i32::MAX as i64).contains(&v) => VarType::Long,
+                _ => VarType::Double,
+            }),
+            Expr::Float(_) => Some(VarType::Double),
+            Expr::Typed(_, suffix) => Some(match suffix {
+                '%' => VarType::Integer,
+                '&' => VarType::Long,
+                '^' => VarType::LongLong,
+                '!' => VarType::Single,
+                '@' => VarType::Currency,
+                _ => VarType::Double,
+            }),
+            Expr::Str(_) => Some(VarType::String),
+            Expr::Date(_) => Some(VarType::Date),
+            Expr::Bool(_) => Some(VarType::Boolean),
+            Expr::Ident(name) => self.static_type_of_name(name, false),
+            Expr::Index(callee, _) => match &**callee {
+                Expr::Ident(name) => self.static_type_of_name(name, true),
+                _ => None,
+            },
+            Expr::Unary(op, a) => {
+                let v = sample_value(self.static_type(a)?);
+                let r = match op {
+                    UnOp::Neg => value::neg(&v, false),
+                    UnOp::Not => value::not(&v),
+                };
+                static_type_of_value(&r.ok()?)
             }
-            BinOp::Like => {
-                if matches!(a, Value::Null) || matches!(b, Value::Null) {
-                    Value::Null
-                } else {
-                    Value::Boolean(value::like(
-                        &a.to_string_value()?,
-                        &b.to_string_value()?,
-                        text,
-                    ))
-                }
+            Expr::Binary(BinOp::Is, ..) => Some(VarType::Boolean),
+            Expr::Binary(op, a, b) => {
+                let (ta, tb) = (self.static_type(a)?, self.static_type(b)?);
+                let r = apply_binary(
+                    *op,
+                    &sample_value(ta),
+                    &sample_value(tb),
+                    false,
+                    (true, true),
+                );
+                static_type_of_value(&r.ok()?)
             }
-            BinOp::And => value::logical(|x, y| x & y, &a, &b)?,
-            BinOp::Or => value::logical(|x, y| x | y, &a, &b)?,
-            BinOp::Xor => value::logical(|x, y| x ^ y, &a, &b)?,
-            BinOp::Eqv => value::logical(|x, y| !(x ^ y), &a, &b)?,
-            BinOp::Imp => value::logical(|x, y| !x | y, &a, &b)?,
-            BinOp::Is => unreachable!(),
+            _ => None,
+        }
+    }
+
+    /// [`Self::static_type`] of a name: a variable (an element when
+    /// `indexed`), a typed procedure or a `C...` conversion function.
+    fn static_type_of_name(&self, name: &str, indexed: bool) -> Option<VarType> {
+        let fixed = |t: VarType| match t {
+            VarType::Variant | VarType::Object => None,
+            VarType::FixedString(_) => Some(VarType::String),
+            t => Some(t),
+        };
+        if let Some(s) = self.find_slot(name) {
+            let var = s.borrow();
+            return match &var.value {
+                Value::Array(a) if indexed => fixed(a.elem_type),
+                _ if indexed => None,
+                v if var.is_const && var.ty == VarType::Variant => static_type_of_value(v),
+                _ => fixed(var.ty),
+            };
+        }
+        if let Some(proc) = self.procedure(name) {
+            return fixed(VarType::from_name(&proc.return_type.as_ref()?.name));
+        }
+        Some(match name.to_ascii_lowercase().as_str() {
+            "cbool" => VarType::Boolean,
+            "cbyte" => VarType::Byte,
+            "ccur" => VarType::Currency,
+            "cdate" => VarType::Date,
+            "cdbl" => VarType::Double,
+            "cint" => VarType::Integer,
+            "clng" => VarType::Long,
+            "clnglng" => VarType::LongLong,
+            "csng" => VarType::Single,
+            "cstr" => VarType::String,
+            _ => return None,
         })
     }
 
@@ -2316,6 +2378,77 @@ impl ArgSource {
             ArgSource::Value(v) => v,
         }
     }
+}
+
+/// Applies a binary operator other than `Is` to scalar operands; `fixed`
+/// says which operands have a fixed static type.
+fn apply_binary(
+    op: BinOp,
+    a: &Value,
+    b: &Value,
+    text: bool,
+    fixed: (bool, bool),
+) -> VbaResult<Value> {
+    let strict = fixed.0 && fixed.1;
+    Ok(match op {
+        BinOp::Add => value::add(a, b, strict)?,
+        BinOp::Sub => value::sub(a, b, strict)?,
+        BinOp::Mul => value::mul(a, b, strict)?,
+        BinOp::Div => value::div(a, b, strict)?,
+        BinOp::IntDiv => value::int_div(a, b, strict)?,
+        BinOp::Mod => value::modulo(a, b, strict)?,
+        BinOp::Pow => value::pow(a, b)?,
+        BinOp::Concat => value::concat(a, b)?,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            match value::compare_typed(a, b, text, fixed)? {
+                None => Value::Null,
+                ord => Value::Boolean(compare_op(op, ord)),
+            }
+        }
+        BinOp::Like => {
+            if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                Value::Null
+            } else {
+                Value::Boolean(value::like_op(
+                    &a.to_string_value()?,
+                    &b.to_string_value()?,
+                    text,
+                )?)
+            }
+        }
+        BinOp::And => value::logical(|x, y| x & y, a, b)?,
+        BinOp::Or => value::logical(|x, y| x | y, a, b)?,
+        BinOp::Xor => value::logical(|x, y| x ^ y, a, b)?,
+        BinOp::Eqv => value::logical(|x, y| !(x ^ y), a, b)?,
+        BinOp::Imp => value::logical(|x, y| !x | y, a, b)?,
+        BinOp::Is => return Err(VbaError::object_required()),
+    })
+}
+
+/// A value of the given fixed type, for working out an operator's result
+/// type in [`Interpreter::static_type`].
+fn sample_value(t: VarType) -> Value {
+    match t {
+        VarType::Boolean => Value::Boolean(true),
+        VarType::String | VarType::FixedString(_) => Value::str("1"),
+        t => t.coerce(Value::Integer(1)).unwrap_or_default(),
+    }
+}
+
+fn static_type_of_value(v: &Value) -> Option<VarType> {
+    Some(match v {
+        Value::Boolean(_) => VarType::Boolean,
+        Value::Byte(_) => VarType::Byte,
+        Value::Integer(_) => VarType::Integer,
+        Value::Long(_) => VarType::Long,
+        Value::LongLong(_) => VarType::LongLong,
+        Value::Single(_) => VarType::Single,
+        Value::Double(_) => VarType::Double,
+        Value::Currency(_) => VarType::Currency,
+        Value::Date(_) => VarType::Date,
+        Value::String(_) => VarType::String,
+        _ => return None,
+    })
 }
 
 fn truthy(v: &Value) -> VbaResult<bool> {
