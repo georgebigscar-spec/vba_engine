@@ -1,0 +1,9 @@
+[package]
+name = "vba-runtime"
+description = "Variant type system, host object model and interpreter for VBA"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vba-syntax.workspace = true

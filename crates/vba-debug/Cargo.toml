@@ -1,0 +1,10 @@
+[package]
+name = "vba-debug"
+description = "Debugger for the VBA runtime: breakpoints, stepping, watches"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vba-syntax.workspace = true
+vba-runtime.workspace = true

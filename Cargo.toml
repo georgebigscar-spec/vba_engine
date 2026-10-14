@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/vba-syntax", "crates/vba-runtime", "crates/vba-debug", "crates/vba-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+vba-syntax = { path = "crates/vba-syntax" }
+vba-runtime = { path = "crates/vba-runtime" }
+vba-debug = { path = "crates/vba-debug" }

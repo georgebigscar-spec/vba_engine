@@ -1,0 +1,15 @@
+[package]
+name = "vba-cli"
+description = "Command-line runner and interactive debugger for VBA modules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vba"
+path = "src/main.rs"
+
+[dependencies]
+vba-syntax.workspace = true
+vba-runtime.workspace = true
+vba-debug.workspace = true
