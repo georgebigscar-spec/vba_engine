@@ -174,6 +174,15 @@ fn looks_like_date(rest: &[char]) -> bool {
             .all(|&c| c.is_alphanumeric() || matches!(c, '/' | ':' | '-' | ' ' | ',' | '.'))
 }
 
+/// `word` with the type suffix `last` (the character that ended the
+/// identifier) appended, unless it is not a suffix or already there.
+fn with_suffix(mut word: String, last: char) -> String {
+    if matches!(last, '$' | '%' | '#' | '@') && !word.ends_with(last) {
+        word.push(last);
+    }
+    word
+}
+
 pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
     let chars: Vec<char> = src.chars().collect();
     let mut out = Vec::new();
@@ -386,10 +395,14 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
                 while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
                     j += 1;
                 }
-                let word: String = chars[i..j].iter().collect();
-                // Identifier type suffixes ($ % # @) are accepted and dropped
-                // (`Left$` == `Left`). `&` and `!` stay operators.
+                let mut word: String = chars[i..j].iter().collect();
+                // Identifier type suffixes ($ % # @) are accepted and dropped,
+                // except `$` on string built-ins (`Left$` raises 94 on Null
+                // where `Left` returns Null). `&` and `!` stay operators.
                 if matches!(chars.get(j), Some('$' | '%' | '#' | '@')) {
+                    if chars[j] == '$' && keeps_dollar(&word) {
+                        word.push('$');
+                    }
                     j += 1;
                 }
                 col += (j - i) as u32;
@@ -402,7 +415,9 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
                 }
                 match Kw::lookup(&word) {
                     Some(kw) => push!(Tok::Keyword(kw), sl, sc),
-                    None => push!(Tok::Ident(word), sl, sc),
+                    // The suffix goes to the parser, which reads it in
+                    // declarations (`Dim h$`) and strips it from the name.
+                    None => push!(Tok::Ident(with_suffix(word, chars[i - 1])), sl, sc),
                 }
             }
             _ => {
@@ -431,6 +446,30 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
         span: Span { line, col },
     });
     Ok(out)
+}
+
+/// Built-in functions whose `$` form (`Left$`) differs from the plain one,
+/// so the lexer keeps the `$` in their identifier.
+pub fn keeps_dollar(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "left"
+            | "right"
+            | "mid"
+            | "ucase"
+            | "lcase"
+            | "trim"
+            | "ltrim"
+            | "rtrim"
+            | "space"
+            | "string"
+            | "chr"
+            | "chrw"
+            | "hex"
+            | "oct"
+            | "str"
+            | "format"
+    )
 }
 
 #[cfg(test)]

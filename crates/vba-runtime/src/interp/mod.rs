@@ -10,7 +10,7 @@ use vba_syntax::ast::*;
 use crate::builtins;
 use crate::class::{ClassDef, ClassInstance, ProcSet, TerminateQueue};
 use crate::debug::{DebugAction, DebugContext, DebugHook, Location, StopKind};
-use crate::errobj::ErrObject;
+use crate::errobj::{standard_error, ErrObject};
 use crate::error::{VbaError, VbaResult};
 use crate::host::Host;
 use crate::object::{same_object, Args, Collection, Invoke, ObjectRef};
@@ -68,6 +68,10 @@ struct Frame {
     in_handler: bool,
     /// Block (by address) and statement index to come back to with `Resume`.
     resume_target: Option<(usize, usize)>,
+    /// `GoSub` calls waiting for their `Return`.
+    gosub_depth: usize,
+    /// The last line number (`100 x = 1`) passed, for `Erl`.
+    line_number: i64,
 }
 
 /// The object of a `With` block. A user-defined type is kept as the place
@@ -104,6 +108,8 @@ enum Flow {
     Exit(ExitKind),
     GoTo(String),
     Resume(ResumeKind),
+    /// `Return` from a `GoSub`.
+    Return,
 }
 
 pub struct Interpreter {
@@ -131,6 +137,9 @@ pub struct Interpreter {
     files: HashMap<i64, OpenFile>,
     /// The rest of the last `Dir(pattern)` search, for `Dir()`.
     dir_pending: Option<Vec<String>>,
+    /// `Static` locals by procedure (address), instance (address, 0 in a
+    /// standard module) and lower-case name.
+    statics: HashMap<(usize, usize, String), Slot>,
 }
 
 impl Interpreter {
@@ -152,6 +161,7 @@ impl Interpreter {
             print_pending: None,
             files: HashMap::new(),
             dir_pending: None,
+            statics: HashMap::new(),
         }
     }
 
@@ -525,16 +535,28 @@ impl Interpreter {
         let mut positional: Vec<Option<ArgSource>> = positional.into_iter().map(Some).collect();
         let mut named = named;
         let mut locals = Vec::with_capacity(proc.params.len() + 1);
+        // ParamArray elements are ByRef: variables passed in get the
+        // elements back when the procedure returns.
+        let mut param_refs: Option<(Slot, Vec<(usize, Slot)>)> = None;
         for (i, p) in proc.params.iter().enumerate() {
             if p.param_array {
+                let mut refs = Vec::new();
                 let rest: Vec<Value> = positional
                     .iter_mut()
                     .skip(i)
                     .filter_map(Option::take)
-                    .map(ArgSource::into_value)
+                    .enumerate()
+                    .map(|(k, src)| {
+                        if let ArgSource::Slot(s) = &src {
+                            refs.push((k, s.clone()));
+                        }
+                        src.into_value()
+                    })
                     .collect();
                 let arr = Value::Array(Box::new(VbArray::from_values(rest, 0)));
-                locals.push((p.name.clone(), slot(arr, VarType::Variant)));
+                let s = slot(arr, VarType::Variant);
+                param_refs = Some((s.clone(), refs));
+                locals.push((p.name.clone(), s));
                 break;
             }
             let ty = self.var_type_of(p.ty.as_ref());
@@ -586,6 +608,8 @@ impl Interpreter {
             on_error: ErrMode::Off,
             in_handler: false,
             resume_target: None,
+            gosub_depth: 0,
+            line_number: 0,
         });
         let _ = self.with_hook(|h, ctx| {
             h.on_enter(ctx);
@@ -596,6 +620,18 @@ impl Interpreter {
             Flow::Resume(_) => Err(VbaError::new(20, "Resume without error")),
             _ => Ok(()),
         });
+        if let Some((arr, refs)) = param_refs {
+            if let Value::Array(a) = &arr.borrow().value {
+                for (k, s) in refs {
+                    if let Some(v) = a.data.get(k) {
+                        let mut var = s.borrow_mut();
+                        if let Ok(v) = var.ty.coerce(v.clone()) {
+                            var.value = v;
+                        }
+                    }
+                }
+            }
+        }
         if result.is_ok() {
             result = self.before_statement(proc.end_line);
         }
@@ -649,8 +685,12 @@ impl Interpreter {
     }
 
     fn exec_block(&mut self, stmts: &[Stmt]) -> VbaResult<Flow> {
+        self.exec_block_from(stmts, 0)
+    }
+
+    /// Runs `stmts` from statement `pc` on.
+    fn exec_block_from(&mut self, stmts: &[Stmt], mut pc: usize) -> VbaResult<Flow> {
         let block_id = stmts.as_ptr() as usize;
-        let mut pc = 0;
         while pc < stmts.len() {
             match self.exec_stmt(&stmts[pc]) {
                 Ok(Flow::Normal) => pc += 1,
@@ -689,9 +729,11 @@ impl Interpreter {
                     let Some(frame) = self.frames.last_mut() else {
                         return Err(e);
                     };
+                    let line_number = frame.line_number;
                     match frame.on_error.clone() {
                         ErrMode::ResumeNext => {
                             self.err.set(&e);
+                            self.err.set_erl(line_number);
                             pc += 1;
                         }
                         ErrMode::GoTo(label) if !frame.in_handler => {
@@ -700,6 +742,7 @@ impl Interpreter {
                                     frame.in_handler = true;
                                     frame.resume_target = Some((block_id, pc));
                                     self.err.set(&e);
+                                    self.err.set_erl(line_number);
                                     pc = i;
                                 }
                                 None => return Err(e),
@@ -717,7 +760,7 @@ impl Interpreter {
         let line = stmt.span.line;
         if !matches!(
             stmt.kind,
-            StmtKind::Label(_) | StmtKind::Dim(_) | StmtKind::Const(_)
+            StmtKind::Label(_) | StmtKind::Dim(_) | StmtKind::Static(_) | StmtKind::Const(_)
         ) {
             self.before_statement(line)?;
         } else if let Some(f) = self.frame_mut() {
@@ -735,7 +778,15 @@ impl Interpreter {
 
     fn exec_stmt_kind(&mut self, kind: &StmtKind) -> VbaResult<Flow> {
         match kind {
-            StmtKind::Label(_) => {}
+            StmtKind::Label(l) => {
+                if let (Ok(n), Some(f)) = (l.parse::<i64>(), self.frame_mut()) {
+                    f.line_number = n;
+                }
+            }
+            StmtKind::Static(vars) => self.declare_static(vars)?,
+            StmtKind::Dim(vars) if self.frame().is_some_and(|f| f.procedure.is_static) => {
+                self.declare_static(vars)?
+            }
             StmtKind::Dim(vars) => {
                 for v in vars {
                     let s = self.new_var_slot(v)?;
@@ -772,7 +823,15 @@ impl Interpreter {
                                     a.redim_preserve(bounds)?;
                                 }
                             } else {
-                                let arr = self.new_array(bounds, d.ty.as_ref())?;
+                                // Without `As`, the array keeps its declared element type.
+                                let declared = match (&d.ty, &s.borrow().value) {
+                                    (None, Value::Array(a)) => Some(a.elem_type),
+                                    _ => None,
+                                };
+                                let arr = match declared {
+                                    Some(elem) => VbArray::new(bounds, elem),
+                                    None => self.new_array(bounds, d.ty.as_ref())?,
+                                };
                                 s.borrow_mut().value = Value::Array(Box::new(arr));
                             }
                         }
@@ -865,7 +924,7 @@ impl Interpreter {
                 body,
             } => {
                 let items = match self.eval(collection)? {
-                    Value::Array(a) => a.data,
+                    Value::Array(a) => column_major(*a),
                     Value::Object(Some(o)) => self.enumerate(&o)?,
                     Value::Object(None) => return Err(VbaError::object_not_set()),
                     _ => return Err(VbaError::new(92, "For loop not initialized")),
@@ -975,6 +1034,36 @@ impl Interpreter {
             }
             StmtKind::Resume(k) => return Ok(Flow::Resume(k.clone())),
             StmtKind::GoTo(l) => return Ok(Flow::GoTo(l.clone())),
+            StmtKind::GoSub(l) => return self.exec_gosub(l),
+            StmtKind::Return => {
+                if self.frame().is_none_or(|f| f.gosub_depth == 0) {
+                    return Err(standard_error(3));
+                }
+                return Ok(Flow::Return);
+            }
+            StmtKind::OnGoTo {
+                index,
+                labels,
+                gosub,
+            } => {
+                let v = self.eval(index)?;
+                let n = self.scalar(v)?.to_i64()?;
+                if !(0..=255).contains(&n) {
+                    return Err(VbaError::invalid_call());
+                }
+                if let Some(l) = labels.get((n as usize).wrapping_sub(1)) {
+                    return if *gosub {
+                        self.exec_gosub(l)
+                    } else {
+                        Ok(Flow::GoTo(l.clone()))
+                    };
+                }
+            }
+            StmtKind::Error(n) => {
+                let n = self.eval(n)?.to_i64()?;
+                let n = i32::try_from(n).map_err(|_| VbaError::overflow())?;
+                return Err(standard_error(n));
+            }
             StmtKind::End => return Err(VbaError::end()),
             StmtKind::RaiseEvent { name, args } => self.raise_event(name, args)?,
             StmtKind::Open { path, mode, file } => self.exec_open(path, *mode, file)?,
@@ -1047,8 +1136,9 @@ impl Interpreter {
                 .and_then(|m| m.call.clone())
             {
                 let info = sink_inst.class.info.clone();
-                let (positional, named) = self.arg_sources(args)?;
-                self.call_procedure(p, info, Some(sink.clone()), positional, named)?;
+                self.call_with_args(args, |me, positional, named| {
+                    me.call_procedure(p, info, Some(sink.clone()), positional, named)
+                })?;
             }
         }
         Ok(())
@@ -1085,6 +1175,52 @@ impl Interpreter {
                 list.push((Rc::downgrade(&me), name.to_string()));
             }
         }
+    }
+
+    /// `GoSub label`: runs the procedure body from the label until `Return`.
+    /// Reaching the end of the procedure instead ends it.
+    fn exec_gosub(&mut self, label: &str) -> VbaResult<Flow> {
+        let proc = self.frame().expect("frame").procedure.clone();
+        let start =
+            find_label(&proc.body, label).ok_or_else(|| VbaError::label_not_defined(label))?;
+        self.frame_mut().expect("frame").gosub_depth += 1;
+        let r = self.exec_block_from(&proc.body, start);
+        if let Some(f) = self.frame_mut() {
+            f.gosub_depth -= 1;
+        }
+        Ok(match r? {
+            Flow::Return => Flow::Normal,
+            Flow::Normal => Flow::Exit(ExitKind::Sub),
+            other => other,
+        })
+    }
+
+    /// `Static x` (or `Dim x` in a `Static Sub`): the variable is created on
+    /// the first call and then shared by later calls.
+    fn declare_static(&mut self, vars: &[VarDecl]) -> VbaResult<()> {
+        let Some(f) = self.frame() else {
+            return Ok(());
+        };
+        let proc = Rc::as_ptr(&f.procedure) as usize;
+        let inst =
+            f.me.as_ref()
+                .map_or(0, |o| Rc::as_ptr(o) as *const () as usize);
+        for v in vars {
+            let key = (proc, inst, v.name.to_ascii_lowercase());
+            let s = match self.statics.get(&key) {
+                Some(s) => s.clone(),
+                None => {
+                    let s = self.new_var_slot(v)?;
+                    self.statics.insert(key, s.clone());
+                    s
+                }
+            };
+            self.frame_mut()
+                .expect("frame")
+                .locals
+                .push((v.name.clone(), s));
+        }
+        Ok(())
     }
 
     fn loop_cond(&mut self, c: &LoopCond) -> VbaResult<bool> {
@@ -1345,6 +1481,12 @@ impl Interpreter {
             return Ok((VarType::Variant, self.new_udt(&def)?));
         }
         let vt = self.declared_type(t)?;
+        if t.array {
+            return Ok((
+                VarType::Variant,
+                Value::Array(Box::new(VbArray::new(vec![], vt))),
+            ));
+        }
         if t.is_new {
             return Ok((vt, self.new_object(&t.name)?));
         }
@@ -1878,8 +2020,9 @@ impl Interpreter {
             .module_procs(info, member)
             .and_then(|set| set.for_kind(&kind))
             .ok_or_else(|| Self::member_not_found(member))?;
-        let (positional, named) = self.arg_sources(args)?;
-        self.call_procedure(proc, info.clone(), None, positional, named)
+        self.call_with_args(args, |me, positional, named| {
+            me.call_procedure(proc, info.clone(), None, positional, named)
+        })
     }
 
     /// `Module1.Counter = 5`.
@@ -1954,6 +2097,7 @@ impl Interpreter {
                 self.eval_call(e, &[], Invoke::Get)?
             }
             Expr::Index(callee, args) => self.eval_call(callee, args, Invoke::Get)?,
+            Expr::Paren(a) => self.eval(a)?,
             Expr::Unary(UnOp::Neg, a) => {
                 let v = self.eval(a)?;
                 value::neg(&self.scalar(v)?)?
@@ -2042,7 +2186,15 @@ impl Interpreter {
         Ok(out)
     }
 
-    fn arg_sources(&mut self, args: &[Arg]) -> VbaResult<ArgSources> {
+    /// Calls `call` with the arguments as ByRef sources, then stores what
+    /// the callee left in array elements and fields passed ByRef back into
+    /// them.
+    fn call_with_args(
+        &mut self,
+        args: &[Arg],
+        call: impl FnOnce(&mut Self, Vec<ArgSource>, Vec<(String, ArgSource)>) -> VbaResult<Value>,
+    ) -> VbaResult<Value> {
+        let mut places = Vec::new();
         let mut positional = Vec::new();
         let mut named = Vec::new();
         for a in args {
@@ -2050,6 +2202,13 @@ impl Interpreter {
                 Some(Expr::Ident(n)) => match self.find_slot(n) {
                     Some(s) => ArgSource::Slot(s),
                     None => ArgSource::Value(self.eval(a.value.as_ref().unwrap())?),
+                },
+                Some(e @ (Expr::Index(..) | Expr::Member(..))) => match self.data_place(e)? {
+                    Some((place, s)) => {
+                        places.push((place, s.clone()));
+                        ArgSource::Slot(s)
+                    }
+                    None => ArgSource::Value(self.eval(e)?),
                 },
                 Some(e) => ArgSource::Value(self.eval(e)?),
                 None => ArgSource::Value(Value::Missing),
@@ -2059,7 +2218,79 @@ impl Interpreter {
                 None => positional.push(src),
             }
         }
-        Ok((positional, named))
+        let r = call(self, positional, named);
+        for (place, s) in places {
+            let v = s.borrow().value.clone();
+            let w = self.assign_place(&place, &mut |dst, _| {
+                *dst = v.clone();
+                Ok(())
+            });
+            if r.is_ok() {
+                w?;
+            }
+        }
+        r
+    }
+
+    /// An array element or user-defined-type field passed as an argument
+    /// (`Inc arr(1)`, `Inc p.Scores(1)`): the place with its subscripts
+    /// evaluated, and a variable holding its current value.
+    fn data_place(&mut self, e: &Expr) -> VbaResult<Option<(Expr, Slot)>> {
+        fn root(e: &Expr) -> Option<&str> {
+            match e {
+                Expr::Ident(n) => Some(n),
+                Expr::Index(b, _) | Expr::Member(b, _) => root(b),
+                _ => None,
+            }
+        }
+        let Some(name) = root(e) else {
+            return Ok(None);
+        };
+        let is_data = self
+            .find_slot(name)
+            .is_some_and(|s| matches!(s.borrow().value, Value::Array(_) | Value::Udt(_)));
+        let current_fn = self
+            .frame()
+            .is_some_and(|f| f.procedure.name.eq_ignore_ascii_case(name));
+        if !is_data || current_fn {
+            return Ok(None);
+        }
+        let place = self.freeze_place(e)?;
+        let mut current = None;
+        let read = self.assign_place(&place, &mut |v, ty| {
+            current = Some((v.clone(), ty));
+            Ok(())
+        });
+        Ok(match (read, current) {
+            (Ok(()), Some((v, ty))) if !matches!(v, Value::Object(_)) => Some((place, slot(v, ty))),
+            _ => None,
+        })
+    }
+
+    /// `e` with its subscripts evaluated, so that reading and writing it
+    /// back evaluate them once.
+    fn freeze_place(&mut self, e: &Expr) -> VbaResult<Expr> {
+        Ok(match e {
+            Expr::Index(b, args) => {
+                let mut frozen = Vec::with_capacity(args.len());
+                for a in args {
+                    let value = match &a.value {
+                        Some(v) => Some(match self.eval(v)? {
+                            Value::String(s) => Expr::Str(s),
+                            v => Expr::Int(v.to_i64()?),
+                        }),
+                        None => None,
+                    };
+                    frozen.push(Arg {
+                        name: a.name.clone(),
+                        value,
+                    });
+                }
+                Expr::Index(Box::new(self.freeze_place(b)?), frozen)
+            }
+            Expr::Member(b, f) => Expr::Member(Box::new(self.freeze_place(b)?), f.clone()),
+            e => e.clone(),
+        })
     }
 
     /// Evaluates `callee(args)`: array indexing, procedure call, built-in,
@@ -2101,19 +2332,24 @@ impl Interpreter {
                         .downcast_ref::<ClassInstance>()
                         .expect("class instance");
                     if inst.class.members.contains_key(&name.to_ascii_lowercase()) {
-                        let (positional, named) = self.arg_sources(args)?;
-                        return self.call_member(&me, name, kind, positional, named);
+                        return self.call_with_args(args, |this, positional, named| {
+                            this.call_member(&me, name, kind, positional, named)
+                        });
                     }
                 }
                 if let Some((proc, module)) = self
                     .lookup_proc(name)
                     .and_then(|(set, m)| set.for_kind(&Invoke::Get).map(|p| (p, m)))
                 {
-                    let (positional, named) = self.arg_sources(args)?;
-                    return self.call_procedure(proc, module, None, positional, named);
+                    return self.call_with_args(args, |me, positional, named| {
+                        me.call_procedure(proc, module, None, positional, named)
+                    });
                 }
                 if name.eq_ignore_ascii_case("err") {
                     return self.index_value(Value::from(self.err.clone()), args, kind);
+                }
+                if name.eq_ignore_ascii_case("erl") && args.is_empty() {
+                    return Ok(Value::Long(self.err.erl() as i32));
                 }
                 let mut evaluated = self.eval_args(args)?;
                 if let Some(r) = self.file_builtin(name, &evaluated) {
@@ -2217,8 +2453,9 @@ impl Interpreter {
     ) -> VbaResult<Value> {
         if o.as_any().is::<ClassInstance>() {
             // VBA class methods get ByRef arguments.
-            let (positional, named) = self.arg_sources(args)?;
-            return self.call_member(o, member, kind, positional, named);
+            return self.call_with_args(args, |me, positional, named| {
+                me.call_member(o, member, kind, positional, named)
+            });
         }
         let evaluated = self.eval_args(args)?;
         o.invoke(member, kind, evaluated)
@@ -2254,9 +2491,6 @@ impl Drop for Interpreter {
         self.discard_terminators();
     }
 }
-
-/// Positional and named argument sources of a call.
-type ArgSources = (Vec<ArgSource>, Vec<(String, ArgSource)>);
 
 enum ArgSource {
     Slot(Slot),
@@ -2294,6 +2528,32 @@ fn compare_op(op: BinOp, ord: Option<Ordering>) -> bool {
 
 fn indices(args: &Args) -> VbaResult<Vec<i64>> {
     args.positional.iter().map(|v| v.to_i64()).collect()
+}
+
+/// Array elements in `For Each` order: the first index varies fastest.
+fn column_major(a: VbArray) -> Vec<Value> {
+    if a.bounds.len() < 2 {
+        return a.data;
+    }
+    let dims: Vec<usize> = a
+        .bounds
+        .iter()
+        .map(|(l, u)| (u - l + 1).max(0) as usize)
+        .collect();
+    let mut idx = vec![0usize; dims.len()];
+    let mut out = Vec::with_capacity(a.data.len());
+    for _ in 0..a.data.len() {
+        let off = idx.iter().zip(&dims).fold(0, |o, (i, d)| o * d + i);
+        out.push(a.data[off].clone());
+        for (i, d) in idx.iter_mut().zip(&dims) {
+            *i += 1;
+            if *i < *d {
+                break;
+            }
+            *i = 0;
+        }
+    }
+    out
 }
 
 fn find_label(stmts: &[Stmt], label: &str) -> Option<usize> {

@@ -1,7 +1,7 @@
 //! Recursive-descent parser producing [`ast::Module`](crate::ast::Module).
 
 use crate::ast::*;
-use crate::lexer::{Kw, Tok, Token};
+use crate::lexer::{keeps_dollar, Kw, Tok, Token};
 use crate::{Span, SyntaxError};
 
 type PResult<T> = Result<T, SyntaxError>;
@@ -11,14 +11,34 @@ pub struct Parser {
     pos: usize,
     /// `VB_UserMemId` read from `Attribute` lines of the procedure being parsed.
     user_mem_id: Option<i64>,
+    /// Type-declaration suffix (`$ % # @`) of the identifier at a token index.
+    suffixes: Vec<Option<char>>,
 }
 
 impl Parser {
-    pub fn new(toks: Vec<Token>) -> Self {
+    pub fn new(mut toks: Vec<Token>) -> Self {
+        // `h$` names the variable `h`; the suffix only matters where it is
+        // declared. `Left$` stays as written: it is a different built-in.
+        let suffixes = toks
+            .iter_mut()
+            .map(|t| match &mut t.tok {
+                Tok::Ident(w) if w.len() > 1 && w.ends_with(['$', '%', '#', '@']) => {
+                    let c = w.pop().expect("suffix");
+                    if c == '$' && keeps_dollar(w) {
+                        w.push(c);
+                        None
+                    } else {
+                        Some(c)
+                    }
+                }
+                _ => None,
+            })
+            .collect();
         Parser {
             toks,
             pos: 0,
             user_mem_id: None,
+            suffixes,
         }
     }
 
@@ -247,12 +267,14 @@ impl Parser {
             } else {
                 None
             };
-            if self.is_ident("Static") {
+            let is_static = self.is_ident("Static");
+            if is_static {
                 self.bump();
             }
             if self.is_kw(Kw::Sub) || self.is_kw(Kw::Function) || self.at_property() {
-                let proc =
+                let mut proc =
                     self.parse_procedure(explicit_vis.unwrap_or(Visibility::Public), start)?;
+                proc.is_static = is_static;
                 module.procedures.push(proc);
             } else if self.is_ident("Event") && matches!(self.peek_at(1), Tok::Ident(_)) {
                 self.bump();
@@ -375,12 +397,19 @@ impl Parser {
                 _ => ProcKind::PropertyGet,
             }
         };
+        let suffix = self.suffix_type();
         let name = self.ident()?;
         let params = self.parse_params()?;
         let return_type = if self.eat_kw(Kw::As) {
-            Some(self.parse_type()?)
+            let mut t = self.parse_type()?;
+            // `As Long()`: the function returns an array.
+            if self.is_op("(") && matches!(self.peek_at(1), Tok::Op(")")) {
+                self.pos += 2;
+                t.array = true;
+            }
+            Some(t)
         } else {
-            None
+            suffix
         };
         self.end_stmt()?;
         self.user_mem_id = None;
@@ -403,6 +432,7 @@ impl Parser {
             span,
             end_line,
             user_mem_id: self.user_mem_id.take(),
+            is_static: false,
         })
     }
 
@@ -500,6 +530,45 @@ impl Parser {
             name,
             is_new,
             fixed_len,
+            array: false,
+        })
+    }
+
+    /// The type a suffix gives the identifier at the current token:
+    /// `h$`, `n%`, `k#`, `c@` (kept by the lexer), or `g&`, `m!` (operator
+    /// tokens right after the name, consumed here).
+    fn suffix_type(&mut self) -> Option<TypeName> {
+        let c = match self.suffixes.get(self.pos).copied().flatten() {
+            Some(c) => c,
+            None => {
+                let (Tok::Ident(w), Tok::Op(op @ ("&" | "!"))) = (self.peek(), self.peek_at(1))
+                else {
+                    return None;
+                };
+                let (here, next) = (self.span(), self.toks[self.pos + 1].span);
+                if next.line != here.line || next.col != here.col + w.chars().count() as u32 {
+                    return None;
+                }
+                let c = op.chars().next().expect("op");
+                self.toks.remove(self.pos + 1);
+                self.suffixes.remove(self.pos + 1);
+                c
+            }
+        };
+        let name = match c {
+            '%' => "Integer",
+            '&' => "Long",
+            '^' => "LongLong",
+            '!' => "Single",
+            '#' => "Double",
+            '@' => "Currency",
+            _ => "String",
+        };
+        Some(TypeName {
+            name: name.into(),
+            is_new: false,
+            fixed_len: None,
+            array: false,
         })
     }
 
@@ -510,6 +579,7 @@ impl Parser {
             if with_events {
                 self.bump();
             }
+            let suffix = self.suffix_type();
             let name = self.ident()?;
             let mut bounds = None;
             if self.eat_op("(") {
@@ -533,7 +603,7 @@ impl Parser {
             let ty = if self.eat_kw(Kw::As) {
                 Some(self.parse_type()?)
             } else {
-                None
+                suffix
             };
             decls.push(VarDecl {
                 name,
@@ -581,8 +651,12 @@ impl Parser {
                 self.end_stmt()?;
                 continue;
             }
+            // A line number may be followed by a statement on the same line.
+            let line_number = matches!(self.peek(), Tok::Int(_));
             out.push(self.parse_statement()?);
-            self.end_stmt()?;
+            if !line_number {
+                self.end_stmt()?;
+            }
         }
     }
 
@@ -606,7 +680,20 @@ impl Parser {
         }
         if self.is_ident("Static") {
             self.bump();
-            return Ok(StmtKind::Dim(self.parse_var_decls()?));
+            return Ok(StmtKind::Static(self.parse_var_decls()?));
+        }
+        if self.is_ident("GoSub") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Int(_)) {
+            self.bump();
+            return Ok(StmtKind::GoSub(self.label_name()?));
+        }
+        if self.is_ident("Return")
+            && matches!(
+                self.peek_at(1),
+                Tok::Newline | Tok::Eof | Tok::Op(":") | Tok::Keyword(Kw::Else)
+            )
+        {
+            self.bump();
+            return Ok(StmtKind::Return);
         }
         if let Some(kind) = self.parse_file_statement()? {
             return Ok(kind);
@@ -711,6 +798,25 @@ impl Parser {
                 };
                 Ok(StmtKind::Exit(k))
             }
+            Kw::On if *self.peek_at(1) != Tok::Keyword(Kw::Error) => {
+                self.bump();
+                let index = self.parse_expr()?;
+                let gosub = self.is_ident("GoSub");
+                if gosub {
+                    self.bump();
+                } else {
+                    self.expect_kw(Kw::GoTo)?;
+                }
+                let mut labels = vec![self.label_name()?];
+                while self.eat_op(",") {
+                    labels.push(self.label_name()?);
+                }
+                Ok(StmtKind::OnGoTo {
+                    index,
+                    labels,
+                    gosub,
+                })
+            }
             Kw::On => {
                 self.bump();
                 self.expect_kw(Kw::Error)?;
@@ -744,6 +850,10 @@ impl Parser {
             Kw::End => {
                 self.bump();
                 Ok(StmtKind::End)
+            }
+            Kw::Error if !matches!(self.peek_at(1), Tok::Op("=" | ".")) => {
+                self.bump();
+                Ok(StmtKind::Error(self.parse_expr()?))
             }
             _ => self.parse_simple_statement(),
         }
@@ -910,7 +1020,7 @@ impl Parser {
             let value = self.parse_expr()?;
             // `Mid(s, 2, 3) = "abc"` replaces characters in place.
             if let Expr::Index(callee, args) = &target {
-                if matches!(&**callee, Expr::Ident(n) if n.eq_ignore_ascii_case("mid"))
+                if matches!(&**callee, Expr::Ident(n) if n.eq_ignore_ascii_case("mid") || n.eq_ignore_ascii_case("mid$"))
                     && (2..=3).contains(&args.len())
                     && args.iter().all(|a| a.name.is_none() && a.value.is_some())
                 {
@@ -927,10 +1037,23 @@ impl Parser {
         }
         if self.at_stmt_end() {
             return Ok(match target {
-                Expr::Index(callee, args) => StmtKind::Call {
-                    callee: *callee,
-                    args,
-                },
+                // `Foo (x)` without `Call`: the parentheses belong to the
+                // argument, which is then passed by value.
+                Expr::Index(callee, mut args) => {
+                    if let [Arg {
+                        name: None,
+                        value: Some(v),
+                    }] = args.as_mut_slice()
+                    {
+                        if !matches!(v, Expr::Paren(_)) {
+                            *v = Expr::Paren(Box::new(std::mem::replace(v, Expr::Empty)));
+                        }
+                    }
+                    StmtKind::Call {
+                        callee: *callee,
+                        args,
+                    }
+                }
                 callee => StmtKind::Call {
                     callee,
                     args: vec![],
@@ -1031,6 +1154,19 @@ impl Parser {
         self.bump();
         if matches!(self.peek(), Tok::Ident(_)) {
             self.bump();
+            // `Next j, i` closes the enclosing loop too: read it as `Next j: Next i`.
+            if self.is_op(",") {
+                let span = self.span();
+                self.toks[self.pos].tok = Tok::Op(":");
+                self.toks.insert(
+                    self.pos + 1,
+                    Token {
+                        tok: Tok::Keyword(Kw::Next),
+                        span,
+                    },
+                );
+                self.suffixes.insert(self.pos + 1, None);
+            }
         }
         Ok(body)
     }
@@ -1282,7 +1418,7 @@ impl Parser {
             Tok::Op("(") => {
                 let e = self.parse_expr()?;
                 self.expect_op(")")?;
-                e
+                Expr::Paren(Box::new(e))
             }
             other => {
                 return Err(SyntaxError::new(

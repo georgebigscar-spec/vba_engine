@@ -52,6 +52,7 @@ Sub Main()
     TestForEach
     TestExit
     TestGoTo
+    TestGoSub
     TestOnErrorResumeNext
     TestOnErrorGoTo
     TestResume
@@ -77,7 +78,12 @@ Sub Main()
     TestEnum
     TestLineSyntax
     TestTypeSuffixDim
-    TestGoSub
+    TestSharedNext
+    TestLineNumbers
+    TestOnGoSubGoTo
+    TestLongSuffixDim
+    TestSingleSuffixDim
+    TestTypedArrayReturn
 End Sub
 
 ' ---------------------------------------------------------------- helpers
@@ -218,7 +224,7 @@ Private Function ReturnsArray() As Variant
     ReturnsArray = Array(1, 2, 3)
 End Function
 
-Private Function ReturnsLongArray() As Variant
+Private Function ReturnsLongArray() As Long()
     Dim a(1 To 2) As Long
     a(1) = 5: a(2) = 6
     ReturnsLongArray = a
@@ -1443,118 +1449,107 @@ Private Sub TestTypeSuffixDim()
     CheckTyped "dim-statement: @", n, CCur(0)
 End Sub
 
-' ---------------------------------------------------------------- unparsed
-' The constructs below are valid VBA but the engine's parser rejects them
-' (line number followed by a statement, On...GoTo/GoSub, Next j, i,
-' Dim g& / Dim m!, Function ... As Long()). They are kept commented out so
-' the rest of this file can run. To enable: remove the leading "' " from
-' each line of this block and add these calls to Main:
-'    TestSharedNext
-'    TestLineNumbers
-'    TestOnGoSubGoTo
-'    TestLongSuffixDim
-'    TestSingleSuffixDim
-'    TestTypedArrayReturn
-'
-' Private Sub TestSharedNext()
-'     Dim i As Long, j As Long, n As Long
-'     For i = 1 To 3
-'         For j = 1 To 4
-'             n = n + 1
-'     Next j, i
-'     Check "fornext-statement: Next j, i", n, 12
-' End Sub
-'
-' Private Function ErlDemo() As Long
-'     Dim z As Long, x As Long
-'     On Error GoTo H
-' 10  x = 1
-' 20  x = x \ z
-' 30  x = 3
-'     Exit Function
-' H:
-'     ErlDemo = Erl
-' End Function
-'
-' Private Sub TestLineNumbers()
-'     Dim n As Long
-'     n = 1
-'     GoTo 100
-'     n = 2
-' 100 n = n + 10
-'     Check "goto-statement: line number", n, 11
-'     n = 0
-' 10  n = n + 1
-'     If n < 3 Then GoTo 10
-'     Check "line numbers: GoTo line", n, 3
-'     Check "erl-function: line of error", ErlDemo(), 20
-' End Sub
-'
-' Private Function OnGoTo(ByVal idx As Variant) As String
-'     Dim s As String
-'     s = "start"
-'     On idx GoTo L1, L2, L3
-'     OnGoTo = "fall"
-'     Exit Function
-' L1:
-'     OnGoTo = "one": Exit Function
-' L2:
-'     OnGoTo = "two": Exit Function
-' L3:
-'     OnGoTo = "three"
-' End Function
-'
-' Private Function OnGoSub(ByVal idx As Long) As String
-'     Dim s As String
-'     On idx GoSub G1, G2
-'     s = s & "back"
-'     OnGoSub = s
-'     Exit Function
-' G1:
-'     s = s & "g1,"
-'     Return
-' G2:
-'     s = s & "g2,"
-'     Return
-' End Function
-'
-' Private Sub TestOnGoSubGoTo()
-'     Check "ongosub-ongoto-statement: GoTo 1", OnGoTo(1), "one"
-'     Check "ongosub-ongoto-statement: GoTo 2", OnGoTo(2), "two"
-'     Check "ongosub-ongoto-statement: GoTo 3", OnGoTo(3), "three"
-'     Check "ongosub-ongoto-statement: GoTo 0 falls through", OnGoTo(0), "fall"
-'     Check "ongosub-ongoto-statement: GoTo 4 falls through", OnGoTo(4), "fall"
-'     Check "ongosub-ongoto-statement: GoTo 2.4 rounds", OnGoTo(2.4), "two"
-'     Check "ongosub-ongoto-statement: GoSub 1", OnGoSub(1), "g1,back"
-'     Check "ongosub-ongoto-statement: GoSub 2", OnGoSub(2), "g2,back"
-'     Check "ongosub-ongoto-statement: GoSub 0", OnGoSub(0), "back"
-'     Dim s As String
-'     On Error Resume Next
-'     s = OnGoTo(-1)
-'     CheckErr "ongosub-ongoto-statement: negative index", 5
-'     s = OnGoTo(256)
-'     CheckErr "ongosub-ongoto-statement: index > 255", 5
-'     On Error GoTo 0
-' End Sub
-'
-' Private Sub TestLongSuffixDim()
-'     Dim g&
-'     CheckTyped "dim-statement: &", g, CLng(0)
-' End Sub
-'
-' Private Sub TestSingleSuffixDim()
-'     Dim m!
-'     CheckTyped "dim-statement: !", m, CSng(0)
-' End Sub
-'
-' Private Function ReturnsTypedArray() As Long()
-'     Dim a(1 To 2) As Long
-'     a(2) = 6
-'     ReturnsTypedArray = a
-' End Function
-'
-' Private Sub TestTypedArrayReturn()
-'     Dim rl() As Long
-'     rl = ReturnsTypedArray()
-'     Check "function-statement: returns Long() typed", rl(2), 6
-' End Sub
+' ---------------------------------------------------------------- Next j, i; line numbers; On...GoTo; suffixes
+
+Private Sub TestSharedNext()
+    Dim i As Long, j As Long, n As Long
+    For i = 1 To 3
+        For j = 1 To 4
+            n = n + 1
+    Next j, i
+    Check "fornext-statement: Next j, i", n, 12
+End Sub
+
+Private Function ErlDemo() As Long
+    Dim z As Long, x As Long
+    On Error GoTo H
+10  x = 1
+20  x = x \ z
+30  x = 3
+    Exit Function
+H:
+    ErlDemo = Erl
+End Function
+
+Private Sub TestLineNumbers()
+    Dim n As Long
+    n = 1
+    GoTo 100
+    n = 2
+100 n = n + 10
+    Check "goto-statement: line number", n, 11
+    n = 0
+10  n = n + 1
+    If n < 3 Then GoTo 10
+    Check "line numbers: GoTo line", n, 3
+    Check "erl-function: line of error", ErlDemo(), 20
+End Sub
+
+Private Function OnGoTo(ByVal idx As Variant) As String
+    Dim s As String
+    s = "start"
+    On idx GoTo L1, L2, L3
+    OnGoTo = "fall"
+    Exit Function
+L1:
+    OnGoTo = "one": Exit Function
+L2:
+    OnGoTo = "two": Exit Function
+L3:
+    OnGoTo = "three"
+End Function
+
+Private Function OnGoSub(ByVal idx As Long) As String
+    Dim s As String
+    On idx GoSub G1, G2
+    s = s & "back"
+    OnGoSub = s
+    Exit Function
+G1:
+    s = s & "g1,"
+    Return
+G2:
+    s = s & "g2,"
+    Return
+End Function
+
+Private Sub TestOnGoSubGoTo()
+    Check "ongosub-ongoto-statement: GoTo 1", OnGoTo(1), "one"
+    Check "ongosub-ongoto-statement: GoTo 2", OnGoTo(2), "two"
+    Check "ongosub-ongoto-statement: GoTo 3", OnGoTo(3), "three"
+    Check "ongosub-ongoto-statement: GoTo 0 falls through", OnGoTo(0), "fall"
+    Check "ongosub-ongoto-statement: GoTo 4 falls through", OnGoTo(4), "fall"
+    Check "ongosub-ongoto-statement: GoTo 2.4 rounds", OnGoTo(2.4), "two"
+    Check "ongosub-ongoto-statement: GoSub 1", OnGoSub(1), "g1,back"
+    Check "ongosub-ongoto-statement: GoSub 2", OnGoSub(2), "g2,back"
+    Check "ongosub-ongoto-statement: GoSub 0", OnGoSub(0), "back"
+    Dim s As String
+    On Error Resume Next
+    s = OnGoTo(-1)
+    CheckErr "ongosub-ongoto-statement: negative index", 5
+    s = OnGoTo(256)
+    CheckErr "ongosub-ongoto-statement: index > 255", 5
+    On Error GoTo 0
+End Sub
+
+Private Sub TestLongSuffixDim()
+    Dim g&
+    CheckTyped "dim-statement: &", g, CLng(0)
+End Sub
+
+Private Sub TestSingleSuffixDim()
+    Dim m!
+    CheckTyped "dim-statement: !", m, CSng(0)
+End Sub
+
+Private Function ReturnsTypedArray() As Long()
+    Dim a(1 To 2) As Long
+    a(2) = 6
+    ReturnsTypedArray = a
+End Function
+
+Private Sub TestTypedArrayReturn()
+    Dim rl() As Long
+    rl = ReturnsTypedArray()
+    Check "function-statement: returns Long() typed", rl(2), 6
+End Sub
