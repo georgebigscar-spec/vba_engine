@@ -80,7 +80,7 @@ pub(super) fn call(
         "formatdatetime" => {
             let d = arg(args, 0)?.to_date()?;
             Value::String(match opt_int(args, 1, 0)? {
-                0 => general_date(d),
+                0 => date::format_date(d),
                 1 => format_date_mask(d, LONG_DATE, 1, 1),
                 2 => format_date_mask(d, SHORT_DATE, 1, 1),
                 3 => format_date_mask(d, LONG_TIME, 1, 1),
@@ -109,15 +109,6 @@ fn tristate(args: &Args, i: usize, default: bool) -> VbaResult<bool> {
     }
 }
 
-/// `General Date`: like `CStr`, but midnight of day 0 shows as a time.
-fn general_date(d: f64) -> String {
-    if d == 0.0 {
-        "12:00:00 AM".into()
-    } else {
-        date::format_date(d)
-    }
-}
-
 const SHORT_DATE: &str = "m/d/yyyy";
 const LONG_DATE: &str = "dddd, mmmm d, yyyy";
 const LONG_TIME: &str = "h:nn:ss AM/PM";
@@ -133,7 +124,7 @@ fn format_with(v: &Value, fmt: &str, fdow: i64, fwoy: i64) -> VbaResult<Option<S
     if fmt.is_empty() {
         return Ok(match v {
             Value::Null => None,
-            Value::Date(d) => Some(general_date(*d)),
+            Value::Date(d) => Some(date::format_date(*d)),
             v => Some(v.to_string_value()?),
         });
     }
@@ -160,7 +151,7 @@ fn format_with(v: &Value, fmt: &str, fdow: i64, fwoy: i64) -> VbaResult<Option<S
             Value::String(s) if s.is_empty() => {
                 Some(format_string_mask("", section(1).unwrap_or(&sections[0])))
             }
-            Value::Date(d) => Some(format_string_mask(&general_date(*d), &sections[0])),
+            Value::Date(d) => Some(format_string_mask(&date::format_date(*d), &sections[0])),
             v => Some(format_string_mask(&v.to_string_value()?, &sections[0])),
         });
     }
@@ -207,7 +198,7 @@ fn named_format(v: &Value, fmt: &str) -> VbaResult<Option<Option<String>>> {
         Ok(Some(match v {
             Value::Null => None,
             v => Some(match as_date(v) {
-                Some(d) if mask.is_empty() => general_date(d),
+                Some(d) if mask.is_empty() => date::format_date(d),
                 Some(d) => format_date_mask(d, mask, 1, 1),
                 None => v.to_string_value()?,
             }),
@@ -786,7 +777,7 @@ fn format_date_mask(d: f64, mask: &str, fdow: i64, fwoy: i64) -> String {
                     's' => out.push_str(&pad(sec, run)),
                     't' if run == 5 => out.push_str(&format_date_mask(d, LONG_TIME, fdow, fwoy)),
                     't' => out.push_str(&"t".repeat(run)),
-                    _ => out.push_str(&general_date(d).repeat(run)),
+                    _ => out.push_str(&date::format_date(d).repeat(run)),
                 }
             }
         }
