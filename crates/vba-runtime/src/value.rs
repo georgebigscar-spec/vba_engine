@@ -32,6 +32,38 @@ pub enum Value {
     Error(i32),
     /// An omitted optional argument (`IsMissing` returns True).
     Missing,
+    /// A value of a user-defined type (`Type ... End Type`); copied on assignment.
+    Udt(Box<UdtValue>),
+}
+
+/// A value of a user-defined type.
+#[derive(Clone, Debug)]
+pub struct UdtValue {
+    pub type_name: String,
+    pub fields: Vec<UdtField>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UdtField {
+    pub name: String,
+    pub ty: VarType,
+    pub value: Value,
+}
+
+impl UdtValue {
+    pub fn field(&self, name: &str) -> VbaResult<&UdtField> {
+        self.fields
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| VbaError::new(-1, format!("Method or data member not found: {name}")))
+    }
+
+    pub fn field_mut(&mut self, name: &str) -> VbaResult<&mut UdtField> {
+        self.fields
+            .iter_mut()
+            .find(|f| f.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| VbaError::new(-1, format!("Method or data member not found: {name}")))
+    }
 }
 
 /// The declared type of a variable (`Dim x As Long`).
@@ -239,6 +271,7 @@ impl Value {
             Value::Array(a) => format!("{}()", VarType::name(a.elem_type)),
             Value::Error(_) => "Error".into(),
             Value::Missing => "Error".into(),
+            Value::Udt(u) => u.type_name.clone(),
         }
     }
 
@@ -256,6 +289,7 @@ impl Value {
             Value::String(_) => 8,
             Value::Object(_) => 9,
             Value::Error(_) | Value::Missing => 10,
+            Value::Udt(_) => 36,
             Value::Boolean(_) => 11,
             Value::Byte(_) => 17,
             Value::LongLong(_) => 20,
@@ -323,7 +357,7 @@ impl Value {
             Value::String(s) => s.clone(),
             Value::Null => return Err(VbaError::invalid_use_of_null()),
             Value::Object(Some(o)) => return o.default_value()?.to_string_value(),
-            Value::Object(None) | Value::Array(_) | Value::Missing => {
+            Value::Object(None) | Value::Array(_) | Value::Missing | Value::Udt(_) => {
                 return Err(VbaError::type_mismatch())
             }
             other => other.to_string(),
@@ -437,6 +471,7 @@ impl fmt::Display for Value {
             Value::Array(a) => write!(f, "<Array {:?}>", a.bounds),
             Value::Error(n) => write!(f, "Error {n}"),
             Value::Missing => write!(f, "<Missing>"),
+            Value::Udt(u) => write!(f, "<{}>", u.type_name),
         }
     }
 }

@@ -12,6 +12,7 @@
 //! ```
 
 pub mod builtins;
+pub mod class;
 pub mod date;
 pub mod debug;
 pub mod errobj;
@@ -26,7 +27,7 @@ pub use error::{VbaError, VbaResult};
 pub use host::{CaptureHost, Host, StdHost};
 pub use interp::Interpreter;
 pub use object::{Args, Collection, DynObject, Invoke, Object, ObjectRef};
-pub use value::{Value, VarType, VbArray};
+pub use value::{UdtValue, Value, VarType, VbArray};
 
 use std::fmt;
 

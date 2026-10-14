@@ -51,6 +51,14 @@ pub fn parse_module(src: &str, name: &str) -> Result<ast::Module, SyntaxError> {
     parser::Parser::new(toks).parse_module(name)
 }
 
+/// Parses a class module (`.cls`). Exported files with a
+/// `VERSION 1.0 CLASS` header are detected by [`parse_module`] as well.
+pub fn parse_class_module(src: &str, name: &str) -> Result<ast::Module, SyntaxError> {
+    let mut module = parse_module(src, name)?;
+    module.kind = ast::ModuleKind::Class;
+    Ok(module)
+}
+
 /// Parses a single expression, e.g. a watch or a breakpoint condition.
 pub fn parse_expression(src: &str) -> Result<ast::Expr, SyntaxError> {
     let toks = lexer::tokenize(src)?;
@@ -118,6 +126,61 @@ End Sub
         assert!(
             matches!(e, Expr::Unary(UnOp::Not, ref inner) if matches!(**inner, Expr::Binary(BinOp::Eq, _, _)))
         );
+    }
+
+    #[test]
+    fn parses_class_types_and_enums() {
+        let src = r#"VERSION 1.0 CLASS
+BEGIN
+  MultiUse = -1  'True
+END
+Attribute VB_Name = "Account"
+Option Explicit
+
+Public Enum Status
+    Open = 1
+    Closed
+End Enum
+
+Private Type Entry
+    Amount As Currency
+    Note As String
+End Type
+
+Private mBalance As Currency
+Public Owner As String
+
+Public Property Get Balance() As Currency
+    Balance = mBalance
+End Property
+
+Public Property Let Balance(ByVal value As Currency)
+    If value < 0 Then Exit Property
+    mBalance = value
+End Property
+
+Public Function Total(ParamArray amounts() As Variant) As Double
+    Dim a As Variant
+    For Each a In amounts: Total = Total + a: Next
+End Function
+"#;
+        let m = parse_module(src, "Class1").unwrap();
+        assert_eq!(m.kind, ModuleKind::Class);
+        assert_eq!(m.name, "Account");
+        assert_eq!(m.enums[0].members.len(), 2);
+        assert_eq!(m.types[0].fields.len(), 2);
+        let vis: Vec<Visibility> = m.declarations.iter().map(|d| d.visibility).collect();
+        assert_eq!(vis, vec![Visibility::Private, Visibility::Public]);
+        let kinds: Vec<ProcKind> = m.procedures.iter().map(|p| p.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ProcKind::PropertyGet,
+                ProcKind::PropertyLet,
+                ProcKind::Function
+            ]
+        );
+        assert!(m.procedures[2].params[0].param_array);
     }
 
     #[test]

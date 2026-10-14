@@ -8,12 +8,13 @@ use std::rc::Rc;
 use vba_syntax::ast::*;
 
 use crate::builtins;
+use crate::class::{ClassDef, ClassInstance, ProcSet};
 use crate::debug::{DebugAction, DebugContext, DebugHook, Location, StopKind};
 use crate::errobj::ErrObject;
 use crate::error::{VbaError, VbaResult};
 use crate::host::Host;
 use crate::object::{same_object, Args, Collection, Invoke, ObjectRef};
-use crate::value::{self, Value, VarType, VbArray};
+use crate::value::{self, UdtField, UdtValue, Value, VarType, VbArray};
 
 const MAX_DEPTH: usize = 1000;
 
@@ -47,15 +48,24 @@ struct Frame {
     procedure: Rc<Procedure>,
     module: Rc<ModuleInfo>,
     locals: Vec<(String, Slot)>,
+    /// The instance a class method runs on (`Me`).
+    me: Option<ObjectRef>,
     line: u32,
-    with_stack: Vec<Value>,
+    with_stack: Vec<WithTarget>,
     on_error: ErrMode,
     in_handler: bool,
     /// Block (by address) and statement index to come back to with `Resume`.
     resume_target: Option<(usize, usize)>,
 }
 
-struct ModuleInfo {
+/// The object of a `With` block. A user-defined type is kept as the place
+/// expression it came from, so `.Field = x` writes back to the variable.
+enum WithTarget {
+    Value(Value),
+    Place(Expr),
+}
+
+pub(crate) struct ModuleInfo {
     name: String,
     explicit: bool,
     text_compare: bool,
@@ -70,6 +80,9 @@ enum Flow {
 
 pub struct Interpreter {
     procs: HashMap<String, (Rc<Procedure>, Rc<ModuleInfo>)>,
+    classes: HashMap<String, Rc<ClassDef>>,
+    types: HashMap<String, Rc<TypeDef>>,
+    enums: HashMap<String, Vec<(String, Value)>>,
     globals: Vec<(String, Slot)>,
     frames: Vec<Frame>,
     host: Box<dyn Host>,
@@ -85,6 +98,9 @@ impl Interpreter {
     pub fn new(host: impl Host + 'static) -> Self {
         Interpreter {
             procs: HashMap::new(),
+            classes: HashMap::new(),
+            types: HashMap::new(),
+            enums: HashMap::new(),
             globals: Vec::new(),
             frames: Vec::new(),
             host: Box::new(host),
@@ -114,12 +130,61 @@ impl Interpreter {
             explicit: module.options.explicit,
             text_compare: module.options.compare_text,
         });
+        for t in module.types {
+            self.types.insert(t.name.to_ascii_lowercase(), Rc::new(t));
+        }
+        for e in &module.enums {
+            let mut next = Value::Long(0);
+            let mut members = Vec::new();
+            for (name, value) in &e.members {
+                let v = match value {
+                    Some(expr) => VarType::Long.coerce(self.eval(expr)?)?,
+                    None => next.clone(),
+                };
+                next = value::add(&v, &Value::Long(1))?;
+                let s = slot(v.clone(), VarType::Long);
+                s.borrow_mut().is_const = true;
+                self.globals.push((name.clone(), s));
+                members.push((name.clone(), v));
+            }
+            self.enums.insert(e.name.to_ascii_lowercase(), members);
+        }
+        if module.kind == ModuleKind::Class {
+            let mut members: HashMap<String, ProcSet> = HashMap::new();
+            for p in module.procedures {
+                members
+                    .entry(p.name.to_ascii_lowercase())
+                    .or_default()
+                    .insert(Rc::new(p));
+            }
+            let mut fields = Vec::new();
+            let mut consts = Vec::new();
+            for d in module.declarations {
+                match d.stmt.kind {
+                    StmtKind::Dim(vars) => {
+                        fields.extend(vars.into_iter().map(|v| (d.visibility, v)))
+                    }
+                    StmtKind::Const(items) => consts.extend(items),
+                    _ => {}
+                }
+            }
+            let class = ClassDef {
+                name: module.name.clone(),
+                info,
+                members,
+                fields,
+                consts,
+            };
+            self.classes
+                .insert(module.name.to_ascii_lowercase(), Rc::new(class));
+            return Ok(());
+        }
         for p in module.procedures {
             self.procs
                 .insert(p.name.to_ascii_lowercase(), (Rc::new(p), info.clone()));
         }
         for decl in &module.declarations {
-            match &decl.kind {
+            match &decl.stmt.kind {
                 StmtKind::Dim(vars) => {
                     for v in vars {
                         let s = self.new_var_slot(v)?;
@@ -161,7 +226,7 @@ impl Interpreter {
             .ok_or_else(|| VbaError::sub_not_defined(name))?;
         self.frames.clear();
         let slots = args.into_iter().map(ArgSource::Value).collect();
-        let r = self.call_procedure(proc, module, slots, Vec::new());
+        let r = self.call_procedure(proc, module, None, slots, Vec::new());
         self.frames.clear();
         match r {
             Err(e) if e.is_end() => Ok(Value::Empty),
@@ -191,11 +256,16 @@ impl Interpreter {
     pub fn locals(&self, frame: usize) -> Vec<(String, Value)> {
         self.frame_index(frame)
             .map(|i| {
-                self.frames[i]
-                    .locals
-                    .iter()
-                    .map(|(n, s)| (n.clone(), s.borrow().value.clone()))
-                    .collect()
+                let f = &self.frames[i];
+                let me =
+                    f.me.iter()
+                        .map(|o| ("Me".to_string(), Value::Object(Some(o.clone()))));
+                me.chain(
+                    f.locals
+                        .iter()
+                        .map(|(n, s)| (n.clone(), s.borrow().value.clone())),
+                )
+                .collect()
             })
             .unwrap_or_default()
     }
@@ -280,22 +350,33 @@ impl Interpreter {
         &mut self,
         proc: Rc<Procedure>,
         module: Rc<ModuleInfo>,
+        me: Option<ObjectRef>,
         positional: Vec<ArgSource>,
         named: Vec<(String, ArgSource)>,
     ) -> VbaResult<Value> {
         if self.frames.len() >= MAX_DEPTH {
             return Err(VbaError::new(28, "Out of stack space"));
         }
-        if positional.len() > proc.params.len() {
+        let has_param_array = proc.params.last().is_some_and(|p| p.param_array);
+        if positional.len() > proc.params.len() && !has_param_array {
             return Err(VbaError::wrong_arg_count());
         }
         let mut positional: Vec<Option<ArgSource>> = positional.into_iter().map(Some).collect();
         let mut named = named;
         let mut locals = Vec::with_capacity(proc.params.len() + 1);
         for (i, p) in proc.params.iter().enumerate() {
-            let ty =
-                p.ty.as_ref()
-                    .map_or(VarType::Variant, |t| VarType::from_name(&t.name));
+            if p.param_array {
+                let rest: Vec<Value> = positional
+                    .iter_mut()
+                    .skip(i)
+                    .filter_map(Option::take)
+                    .map(ArgSource::into_value)
+                    .collect();
+                let arr = Value::Array(Box::new(VbArray::from_values(rest, 0)));
+                locals.push((p.name.clone(), slot(arr, VarType::Variant)));
+                break;
+            }
+            let ty = self.var_type_of(p.ty.as_ref());
             let src = named
                 .iter()
                 .position(|(n, _)| n.eq_ignore_ascii_case(&p.name))
@@ -329,17 +410,16 @@ impl Interpreter {
         if let Some((n, _)) = named.first() {
             return Err(VbaError::new(448, format!("Named argument not found: {n}")));
         }
-        if proc.kind == ProcKind::Function {
-            let ty = proc
-                .return_type
-                .as_ref()
-                .map_or(VarType::Variant, |t| VarType::from_name(&t.name));
-            locals.push((proc.name.clone(), slot(ty.default_value(), ty)));
+        let returns = matches!(proc.kind, ProcKind::Function | ProcKind::PropertyGet);
+        if returns {
+            let (ty, v) = self.default_of(proc.return_type.as_ref())?;
+            locals.push((proc.name.clone(), slot(v, ty)));
         }
         self.frames.push(Frame {
             procedure: proc.clone(),
             module,
             locals,
+            me,
             line: proc.span.line,
             with_stack: Vec::new(),
             on_error: ErrMode::Off,
@@ -368,13 +448,16 @@ impl Interpreter {
             self.err.clear();
         }
         result?;
-        Ok(match proc.kind {
-            ProcKind::Function => frame
+        Ok(if returns {
+            frame
                 .locals
-                .last()
+                .iter()
+                .rev()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&proc.name))
                 .map(|(_, s)| s.borrow().value.clone())
-                .unwrap_or(Value::Empty),
-            ProcKind::Sub => Value::Empty,
+                .unwrap_or(Value::Empty)
+        } else {
+            Value::Empty
         })
     }
 
@@ -499,29 +582,21 @@ impl Interpreter {
                 for d in decls {
                     let bounds = self.eval_bounds(d.bounds.as_deref().unwrap_or(&[]))?;
                     let existing = self.find_slot(&d.name);
-                    let elem_ty = d.ty.as_ref().map(|t| VarType::from_name(&t.name));
                     match existing {
                         Some(s) => {
-                            let mut var = s.borrow_mut();
-                            match (&mut var.value, *preserve) {
-                                (Value::Array(a), true) => a.redim_preserve(bounds)?,
-                                (Value::Array(a), false) => {
-                                    **a = VbArray::new(bounds, elem_ty.unwrap_or(a.elem_type))
+                            let is_array = matches!(s.borrow().value, Value::Array(_));
+                            if *preserve && is_array {
+                                if let Value::Array(a) = &mut s.borrow_mut().value {
+                                    a.redim_preserve(bounds)?;
                                 }
-                                (v, _) => {
-                                    *v = Value::Array(Box::new(VbArray::new(
-                                        bounds,
-                                        elem_ty.unwrap_or(VarType::Variant),
-                                    )))
-                                }
+                            } else {
+                                let arr = self.new_array(bounds, d.ty.as_ref())?;
+                                s.borrow_mut().value = Value::Array(Box::new(arr));
                             }
                         }
                         None => {
-                            let arr = Value::Array(Box::new(VbArray::new(
-                                bounds,
-                                elem_ty.unwrap_or(VarType::Variant),
-                            )));
-                            self.declare_implicit(&d.name, arr)?;
+                            let arr = self.new_array(bounds, d.ty.as_ref())?;
+                            self.declare_implicit(&d.name, Value::Array(Box::new(arr)))?;
                         }
                     }
                 }
@@ -671,8 +746,19 @@ impl Interpreter {
             }
             StmtKind::With { object, body } => {
                 let obj = self.eval(object)?;
+                let target = match obj {
+                    Value::Udt(_)
+                        if matches!(
+                            object,
+                            Expr::Ident(_) | Expr::Index(..) | Expr::Member(..)
+                        ) =>
+                    {
+                        WithTarget::Place(object.clone())
+                    }
+                    v => WithTarget::Value(v),
+                };
                 if let Some(f) = self.frame_mut() {
-                    f.with_stack.push(obj);
+                    f.with_stack.push(target);
                 }
                 let r = self.exec_block(body);
                 if let Some(f) = self.frame_mut() {
@@ -763,6 +849,14 @@ impl Interpreter {
             {
                 return Some(s.clone());
             }
+            if let Some(inst) =
+                f.me.as_ref()
+                    .and_then(|o| o.as_any().downcast_ref::<ClassInstance>())
+            {
+                if let Some((s, _)) = inst.field_slot(name) {
+                    return Some(s.clone());
+                }
+            }
         }
         self.globals
             .iter()
@@ -791,22 +885,69 @@ impl Interpreter {
     }
 
     fn new_var_slot(&mut self, v: &VarDecl) -> VbaResult<Slot> {
-        let ty =
-            v.ty.as_ref()
-                .map_or(VarType::Variant, |t| VarType::from_name(&t.name));
-        let value = match (&v.bounds, &v.ty) {
-            (Some(bounds), _) => {
-                Value::Array(Box::new(VbArray::new(self.eval_bounds(bounds)?, ty)))
-            }
-            (None, Some(t)) if t.is_new => self.new_object(&t.name)?,
-            _ => ty.default_value(),
-        };
-        let ty = if v.bounds.is_some() {
+        if let Some(bounds) = &v.bounds {
+            let bounds = self.eval_bounds(bounds)?;
+            let arr = self.new_array(bounds, v.ty.as_ref())?;
+            return Ok(slot(Value::Array(Box::new(arr)), VarType::Variant));
+        }
+        let (ty, value) = self.default_of(v.ty.as_ref())?;
+        Ok(slot(value, ty))
+    }
+
+    /// Storage type for a declared type name: enums are Longs, user-defined
+    /// types are held as Variants.
+    fn var_type_of(&self, ty: Option<&TypeName>) -> VarType {
+        let Some(t) = ty else { return VarType::Variant };
+        let lname = t.name.to_ascii_lowercase();
+        if self.enums.contains_key(&lname) {
+            VarType::Long
+        } else if self.types.contains_key(&lname) {
             VarType::Variant
         } else {
-            ty
+            VarType::from_name(&t.name)
+        }
+    }
+
+    /// Storage type and initial value for a declaration.
+    fn default_of(&mut self, ty: Option<&TypeName>) -> VbaResult<(VarType, Value)> {
+        let Some(t) = ty else {
+            return Ok((VarType::Variant, Value::Empty));
         };
-        Ok(slot(value, ty))
+        if let Some(def) = self.types.get(&t.name.to_ascii_lowercase()).cloned() {
+            return Ok((VarType::Variant, self.new_udt(&def)?));
+        }
+        let vt = self.var_type_of(Some(t));
+        if t.is_new {
+            return Ok((vt, self.new_object(&t.name)?));
+        }
+        Ok((vt, vt.default_value()))
+    }
+
+    fn new_udt(&mut self, def: &TypeDef) -> VbaResult<Value> {
+        let mut fields = Vec::with_capacity(def.fields.len());
+        for f in &def.fields {
+            let s = self.new_var_slot(f)?;
+            let var = s.borrow().clone();
+            fields.push(UdtField {
+                name: f.name.clone(),
+                ty: var.ty,
+                value: var.value,
+            });
+        }
+        Ok(Value::Udt(Box::new(UdtValue {
+            type_name: def.name.clone(),
+            fields,
+        })))
+    }
+
+    fn new_array(&mut self, bounds: Vec<(i64, i64)>, ty: Option<&TypeName>) -> VbaResult<VbArray> {
+        let elem = self.var_type_of(ty);
+        let mut arr = VbArray::new(bounds, elem);
+        if let Some(def) = ty.and_then(|t| self.types.get(&t.name.to_ascii_lowercase()).cloned()) {
+            let init = self.new_udt(&def)?;
+            arr.data.iter_mut().for_each(|v| *v = init.clone());
+        }
+        Ok(arr)
     }
 
     fn eval_bounds(&mut self, bounds: &[(Option<Expr>, Expr)]) -> VbaResult<Vec<(i64, i64)>> {
@@ -827,14 +968,211 @@ impl Interpreter {
         {
             return Ok(Value::from(Collection::new()));
         }
+        if let Some(def) = self.classes.get(&class.to_ascii_lowercase()).cloned() {
+            return self.instantiate(def);
+        }
         self.host.new_object(class)
     }
 
-    fn with_object(&self) -> VbaResult<ObjectRef> {
+    fn instantiate(&mut self, def: Rc<ClassDef>) -> VbaResult<Value> {
+        let mut fields = Vec::new();
+        for (vis, decl) in &def.fields {
+            fields.push((decl.name.clone(), self.new_var_slot(decl)?, *vis));
+        }
+        for (name, e) in &def.consts {
+            let s = slot(self.eval(e)?, VarType::Variant);
+            s.borrow_mut().is_const = true;
+            fields.push((name.clone(), s, Visibility::Private));
+        }
+        let obj: ObjectRef = Rc::new(ClassInstance {
+            class: def.clone(),
+            fields,
+        });
+        if let Some(init) = def
+            .members
+            .get("class_initialize")
+            .and_then(|m| m.call.clone())
+        {
+            self.call_procedure(
+                init,
+                def.info.clone(),
+                Some(obj.clone()),
+                Vec::new(),
+                Vec::new(),
+            )?;
+        }
+        Ok(Value::Object(Some(obj)))
+    }
+
+    fn me(&self) -> Option<ObjectRef> {
+        self.frame().and_then(|f| f.me.clone())
+    }
+
+    /// Invokes a member on any object, running VBA class methods here.
+    fn invoke_object(
+        &mut self,
+        o: &ObjectRef,
+        member: &str,
+        kind: Invoke,
+        args: Args,
+    ) -> VbaResult<Value> {
+        if o.as_any().is::<ClassInstance>() {
+            let positional = args.positional.into_iter().map(ArgSource::Value).collect();
+            let named = args
+                .named
+                .into_iter()
+                .map(|(n, v)| (n, ArgSource::Value(v)))
+                .collect();
+            return self.call_member(o, member, kind, positional, named);
+        }
+        o.invoke(member, kind, args)
+    }
+
+    /// Calls a member of a VBA class instance: a method, a property
+    /// procedure, or a field.
+    fn call_member(
+        &mut self,
+        obj: &ObjectRef,
+        member: &str,
+        kind: Invoke,
+        mut positional: Vec<ArgSource>,
+        named: Vec<(String, ArgSource)>,
+    ) -> VbaResult<Value> {
+        let inst = obj
+            .as_any()
+            .downcast_ref::<ClassInstance>()
+            .expect("class instance");
+        let class = inst.class.clone();
+        let inside = self
+            .me()
+            .and_then(|m| {
+                m.as_any()
+                    .downcast_ref::<ClassInstance>()
+                    .map(|i| Rc::ptr_eq(&i.class, &class))
+            })
+            .unwrap_or(false);
+        let visible = |p: &Rc<Procedure>| inside || p.visibility == Visibility::Public;
+        let set = class
+            .members
+            .get(&member.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default();
+        let proc = match &kind {
+            Invoke::Let(_) => set.let_.clone(),
+            Invoke::Set(_) => set.set.clone(),
+            Invoke::Get | Invoke::Method => set.call.clone().or_else(|| set.get.clone()),
+        };
+        if let Some(p) = proc.filter(visible) {
+            if let Invoke::Let(v) | Invoke::Set(v) = kind {
+                positional.push(ArgSource::Value(v));
+            }
+            return self.call_procedure(
+                p,
+                class.info.clone(),
+                Some(obj.clone()),
+                positional,
+                named,
+            );
+        }
+        let field = inst
+            .field_slot(member)
+            .filter(|(_, vis)| inside || *vis == Visibility::Public)
+            .map(|(s, _)| s.clone())
+            .ok_or_else(|| VbaError::not_supported(member))?;
+        match kind {
+            Invoke::Let(v) => {
+                let mut var = field.borrow_mut();
+                var.value = var.ty.coerce(v)?;
+                Ok(Value::Empty)
+            }
+            Invoke::Set(v) => {
+                field.borrow_mut().value = v;
+                Ok(Value::Empty)
+            }
+            kind => {
+                let v = field.borrow().value.clone();
+                let args = Args::new(positional.into_iter().map(ArgSource::into_value).collect());
+                self.index_value_evaluated(v, args, kind)
+            }
+        }
+    }
+
+    fn with_target(&self) -> VbaResult<&WithTarget> {
         self.frame()
             .and_then(|f| f.with_stack.last())
-            .ok_or_else(|| VbaError::new(-1, "Invalid or unqualified reference"))?
-            .as_object()
+            .ok_or_else(|| VbaError::new(-1, "Invalid or unqualified reference"))
+    }
+
+    /// `.Name` inside `With` on a user-defined type, as an ordinary member expression.
+    fn with_place(&self, name: &str) -> Option<Expr> {
+        match self.with_target() {
+            Ok(WithTarget::Place(e)) => Some(Expr::Member(Box::new(e.clone()), name.to_string())),
+            _ => None,
+        }
+    }
+
+    fn with_object(&self) -> VbaResult<ObjectRef> {
+        match self.with_target()? {
+            WithTarget::Value(v) => v.as_object(),
+            WithTarget::Place(_) => Err(VbaError::object_required()),
+        }
+    }
+
+    /// Assigns through a variable, array element or user-defined-type field.
+    fn assign_place(
+        &mut self,
+        target: &Expr,
+        f: &mut dyn FnMut(&mut Value, VarType) -> VbaResult<()>,
+    ) -> VbaResult<()> {
+        match target {
+            Expr::Ident(name) => {
+                let s = match self.find_slot(name) {
+                    Some(s) => s,
+                    None => self.declare_implicit(name, Value::Empty)?,
+                };
+                let mut var = s.borrow_mut();
+                if var.is_const {
+                    return Err(VbaError::new(-1, "Assignment to constant not permitted"));
+                }
+                let ty = var.ty;
+                f(&mut var.value, ty)
+            }
+            Expr::Index(callee, args) => {
+                let idx = indices(&self.eval_args(args)?)?;
+                self.assign_place(callee, &mut |v, _| match v {
+                    Value::Array(a) => {
+                        let off = a.offset(&idx)?;
+                        let ty = a.elem_type;
+                        f(&mut a.data[off], ty)
+                    }
+                    _ => Err(VbaError::type_mismatch()),
+                })
+            }
+            Expr::Member(base, field) => self.assign_place(base, &mut |v, _| match v {
+                Value::Udt(u) => {
+                    let fl = u.field_mut(field)?;
+                    f(&mut fl.value, fl.ty)
+                }
+                _ => Err(VbaError::object_required()),
+            }),
+            Expr::WithMember(name) => match self.with_place(name) {
+                Some(e) => self.assign_place(&e, f),
+                None => Err(VbaError::object_required()),
+            },
+            _ => Err(VbaError::new(-1, "Invalid assignment target")),
+        }
+    }
+
+    fn assign_udt_member(&mut self, target: &Expr, v: Value, is_set: bool) -> VbaResult<()> {
+        let v = if is_set { v } else { v.into_scalar()? };
+        self.assign_place(target, &mut |slot, ty| {
+            *slot = if is_set || matches!(v, Value::Udt(_)) {
+                v.clone()
+            } else {
+                ty.coerce(v.clone())?
+            };
+            Ok(())
+        })
     }
 
     fn assign(&mut self, target: &Expr, v: Value, is_set: bool) -> VbaResult<()> {
@@ -850,6 +1188,18 @@ impl Interpreter {
                 let s = match self.find_slot(name) {
                     Some(s) => s,
                     None => {
+                        // `Balance = 5` inside a class: its own Property Let.
+                        if let Some(me) = self.me() {
+                            let inst = me
+                                .as_any()
+                                .downcast_ref::<ClassInstance>()
+                                .expect("class instance");
+                            if inst.class.members.contains_key(&name.to_ascii_lowercase()) {
+                                return self
+                                    .call_member(&me, name, kind(v), Vec::new(), Vec::new())
+                                    .map(|_| ());
+                            }
+                        }
                         // `ActiveCell = 5`: a property of the host's global object.
                         if let Some(app) = self.host_global_object() {
                             match app.invoke(name, kind(v.clone()), Args::default()) {
@@ -873,24 +1223,43 @@ impl Interpreter {
                     // Let on an object variable assigns its default member.
                     let o = o.clone();
                     drop(var);
-                    o.invoke("", Invoke::Let(v.into_scalar()?), Args::default())?;
+                    self.invoke_object(&o, "", Invoke::Let(v.into_scalar()?), Args::default())?;
+                } else if matches!(v, Value::Udt(_)) {
+                    var.value = v;
                 } else {
                     var.value = var.ty.coerce(v.into_scalar()?)?;
                 }
                 Ok(())
             }
             Expr::Member(obj, name) => {
-                let o = self.eval(obj)?.as_object()?;
+                let base = self.eval(obj)?;
+                if let Value::Udt(_) = base {
+                    return self.assign_udt_member(target, v, is_set);
+                }
+                let o = base.as_object()?;
                 let v = if is_set { v } else { v.into_scalar()? };
-                o.invoke(name, kind(v), Args::default()).map(|_| ())
+                self.invoke_object(&o, name, kind(v), Args::default())
+                    .map(|_| ())
             }
             Expr::WithMember(name) => {
+                if let Some(place) = self.with_place(name) {
+                    return self.assign_udt_member(&place, v, is_set);
+                }
                 let o = self.with_object()?;
                 let v = if is_set { v } else { v.into_scalar()? };
-                o.invoke(name, kind(v), Args::default()).map(|_| ())
+                self.invoke_object(&o, name, kind(v), Args::default())
+                    .map(|_| ())
             }
-            Expr::Index(callee, args) => {
-                let args = self.eval_args(args)?;
+            Expr::Index(callee, raw_args) => {
+                let place_base = match &**callee {
+                    Expr::Member(obj, _) => matches!(self.eval(obj)?, Value::Udt(_)),
+                    Expr::WithMember(n) => self.with_place(n).is_some(),
+                    _ => false,
+                };
+                if place_base {
+                    return self.assign_udt_member(target, v, is_set);
+                }
+                let args = self.eval_args(raw_args)?;
                 let v = if is_set { v } else { v.into_scalar()? };
                 match &**callee {
                     Expr::Ident(name) => {
@@ -900,13 +1269,17 @@ impl Interpreter {
                                 Value::Array(a) => {
                                     let idx = indices(&args)?;
                                     let off = a.offset(&idx)?;
-                                    a.data[off] = a.elem_type.coerce(v)?;
+                                    a.data[off] = if matches!(v, Value::Udt(_)) {
+                                        v
+                                    } else {
+                                        a.elem_type.coerce(v)?
+                                    };
                                     Ok(())
                                 }
                                 Value::Object(Some(o)) => {
                                     let o = o.clone();
                                     drop(var);
-                                    o.invoke("", kind(v), args).map(|_| ())
+                                    self.invoke_object(&o, "", kind(v), args).map(|_| ())
                                 }
                                 _ => Err(VbaError::type_mismatch()),
                             };
@@ -918,14 +1291,15 @@ impl Interpreter {
                     }
                     Expr::Member(obj, name) => {
                         let o = self.eval(obj)?.as_object()?;
-                        o.invoke(name, kind(v), args).map(|_| ())
+                        self.invoke_object(&o, name, kind(v), args).map(|_| ())
                     }
                     Expr::WithMember(name) => {
-                        self.with_object()?.invoke(name, kind(v), args).map(|_| ())
+                        let o = self.with_object()?;
+                        self.invoke_object(&o, name, kind(v), args).map(|_| ())
                     }
                     other => {
                         let o = self.eval(other)?.as_object()?;
-                        o.invoke("", kind(v), args).map(|_| ())
+                        self.invoke_object(&o, "", kind(v), args).map(|_| ())
                     }
                 }
             }
@@ -956,6 +1330,18 @@ impl Interpreter {
             Expr::Null => Value::Null,
             Expr::Empty => Value::Empty,
             Expr::New(class) => self.new_object(class)?,
+            Expr::TypeOf(obj, class) => match self.eval(obj)? {
+                Value::Object(Some(o)) => Value::Boolean(
+                    class.eq_ignore_ascii_case("Object")
+                        || o.type_name().eq_ignore_ascii_case(class)
+                        || class
+                            .rsplit('.')
+                            .next()
+                            .is_some_and(|c| o.type_name().eq_ignore_ascii_case(c)),
+                ),
+                Value::Object(None) => Value::Boolean(false),
+                _ => return Err(VbaError::object_required()),
+            },
             Expr::Ident(_) | Expr::Member(..) | Expr::WithMember(_) => {
                 self.eval_call(e, &[], Invoke::Get)?
             }
@@ -1074,15 +1460,30 @@ impl Interpreter {
                             Value::Object(Some(o)) => {
                                 let o = o.clone();
                                 drop(var);
-                                o.invoke("", kind, evaluated)
+                                self.invoke_object(&o, "", kind, evaluated)
                             }
                             _ => Err(VbaError::type_mismatch()),
                         };
                     }
                 }
+                if name.eq_ignore_ascii_case("me") {
+                    if let Some(me) = self.me() {
+                        return self.index_value(Value::Object(Some(me)), args, kind);
+                    }
+                }
+                if let Some(me) = self.me() {
+                    let inst = me
+                        .as_any()
+                        .downcast_ref::<ClassInstance>()
+                        .expect("class instance");
+                    if inst.class.members.contains_key(&name.to_ascii_lowercase()) {
+                        let (positional, named) = self.arg_sources(args)?;
+                        return self.call_member(&me, name, kind, positional, named);
+                    }
+                }
                 if let Some((proc, module)) = self.procs.get(&name.to_ascii_lowercase()).cloned() {
                     let (positional, named) = self.arg_sources(args)?;
-                    return self.call_procedure(proc, module, positional, named);
+                    return self.call_procedure(proc, module, None, positional, named);
                 }
                 if name.eq_ignore_ascii_case("err") {
                     return self.index_value(Value::from(self.err.clone()), args, kind);
@@ -1125,21 +1526,61 @@ impl Interpreter {
                     if q.eq_ignore_ascii_case("vba") && self.find_slot(q).is_none() {
                         return self.eval_call(&Expr::Ident(member.clone()), args, kind);
                     }
+                    // `Status.Open`: a qualified enum member.
+                    if let Some(members) = self.enums.get(&q.to_ascii_lowercase()) {
+                        if self.find_slot(q).is_none() {
+                            return members
+                                .iter()
+                                .find(|(n, _)| n.eq_ignore_ascii_case(member))
+                                .map(|(_, v)| v.clone())
+                                .ok_or_else(|| {
+                                    VbaError::new(
+                                        -1,
+                                        format!("Method or data member not found: {member}"),
+                                    )
+                                });
+                        }
+                    }
                 }
-                let o = self.eval(obj)?.as_object()?;
-                let evaluated = self.eval_args(args)?;
-                o.invoke(member, kind, evaluated)
+                match self.eval(obj)? {
+                    Value::Udt(u) => {
+                        let v = u.field(member)?.value.clone();
+                        self.index_value(v, args, kind)
+                    }
+                    base => {
+                        let o = base.as_object()?;
+                        self.call_object_member(&o, member, args, kind)
+                    }
+                }
             }
             Expr::WithMember(member) => {
+                if let Some(place) = self.with_place(member) {
+                    return self.eval_call(&place, args, kind);
+                }
                 let o = self.with_object()?;
-                let evaluated = self.eval_args(args)?;
-                o.invoke(member, kind, evaluated)
+                self.call_object_member(&o, member, args, kind)
             }
             other => {
                 let v = self.eval(other)?;
                 self.index_value(v, args, kind)
             }
         }
+    }
+
+    fn call_object_member(
+        &mut self,
+        o: &ObjectRef,
+        member: &str,
+        args: &[Arg],
+        kind: Invoke,
+    ) -> VbaResult<Value> {
+        if o.as_any().is::<ClassInstance>() {
+            // VBA class methods get ByRef arguments.
+            let (positional, named) = self.arg_sources(args)?;
+            return self.call_member(o, member, kind, positional, named);
+        }
+        let evaluated = self.eval_args(args)?;
+        o.invoke(member, kind, evaluated)
     }
 
     fn index_value(&mut self, v: Value, args: &[Arg], kind: Invoke) -> VbaResult<Value> {
@@ -1156,7 +1597,7 @@ impl Interpreter {
         }
         match v {
             Value::Array(a) => Ok(a.data[a.offset(&indices(&args)?)?].clone()),
-            Value::Object(Some(o)) => o.invoke("", kind, args),
+            Value::Object(Some(o)) => self.invoke_object(&o, "", kind, args),
             Value::Object(None) => Err(VbaError::object_not_set()),
             _ => Err(VbaError::type_mismatch()),
         }
@@ -1166,6 +1607,15 @@ impl Interpreter {
 enum ArgSource {
     Slot(Slot),
     Value(Value),
+}
+
+impl ArgSource {
+    fn into_value(self) -> Value {
+        match self {
+            ArgSource::Slot(s) => s.borrow().value.clone(),
+            ArgSource::Value(v) => v,
+        }
+    }
 }
 
 fn truthy(v: &Value) -> VbaResult<bool> {

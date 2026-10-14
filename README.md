@@ -31,6 +31,7 @@ engine.run("Main", vec![])?;
 
 ```sh
 cargo run -p vba-cli -- run examples/Invoice.bas
+cargo run -p vba-cli -- run examples/Bank.bas examples/Account.cls   # classes, Type, Enum
 cargo run -p vba-cli -- debug examples/Invoice.bas   # then: help
 cargo test
 ```

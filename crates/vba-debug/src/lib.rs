@@ -262,6 +262,14 @@ pub fn display(v: &Value) -> String {
                 format!("<{}> {{ {} }}", o.type_name(), props.join(", "))
             }
         }
+        Value::Udt(u) => {
+            let fields: Vec<String> = u
+                .fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, display(&f.value)))
+                .collect();
+            format!("<{}> {{ {} }}", u.type_name, fields.join(", "))
+        }
         other => other.to_string(),
     }
 }
