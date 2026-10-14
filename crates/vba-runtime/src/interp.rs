@@ -1458,10 +1458,7 @@ impl Interpreter {
         Ok(out)
     }
 
-    fn arg_sources(
-        &mut self,
-        args: &[Arg],
-    ) -> VbaResult<(Vec<ArgSource>, Vec<(String, ArgSource)>)> {
+    fn arg_sources(&mut self, args: &[Arg]) -> VbaResult<ArgSources> {
         let mut positional = Vec::new();
         let mut named = Vec::new();
         for a in args {
@@ -1645,6 +1642,9 @@ impl Interpreter {
         }
     }
 }
+
+/// Positional and named argument sources of a call.
+type ArgSources = (Vec<ArgSource>, Vec<(String, ArgSource)>);
 
 enum ArgSource {
     Slot(Slot),

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: test vba-excel without the xlsx feature
+        run: cargo test -p vba-excel --no-default-features
+      - name: run the examples
+        run: |
+          cargo run -q -p vba-cli -- run examples/Invoice.bas
+          cargo run -q -p vba-cli -- run examples/Bank.bas examples/Account.cls
+          cargo run -q -p vba-cli -- run examples/SalesReport.bas --excel --save "$RUNNER_TEMP/report.xlsx"
+          test -s "$RUNNER_TEMP/report.xlsx"
