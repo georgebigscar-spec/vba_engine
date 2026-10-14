@@ -15,6 +15,18 @@ pub struct Module {
     pub procedures: Vec<Procedure>,
     pub types: Vec<TypeDef>,
     pub enums: Vec<EnumDef>,
+    /// `Implements IShape` (class modules).
+    pub implements: Vec<String>,
+    /// `Public Event Changed(ByVal value As Long)` (class modules).
+    pub events: Vec<EventDef>,
+}
+
+/// `Event Name(params)` declared in a class module.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventDef {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -85,6 +97,9 @@ pub struct Procedure {
     pub span: Span,
     /// Line of the closing `End Sub` / `End Function`.
     pub end_line: u32,
+    /// `Attribute Name.VB_UserMemId = n` inside the body: 0 marks the default
+    /// member, -4 the `For Each` enumerator.
+    pub user_mem_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +123,8 @@ pub struct TypeName {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VarDecl {
     pub name: String,
+    /// `Private WithEvents src As Source`: receives `src_EventName` calls.
+    pub with_events: bool,
     pub ty: Option<TypeName>,
     /// `Dim a(1 To 10, 5)` → bounds; `Dim a()` → `Some(vec![])` (dynamic).
     pub bounds: Option<Vec<(Option<Expr>, Expr)>>,
@@ -193,6 +210,11 @@ pub enum StmtKind {
     Label(String),
     /// `End` — terminates the program.
     End,
+    /// `RaiseEvent Name(args)` inside a class module.
+    RaiseEvent {
+        name: String,
+        args: Vec<Arg>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
