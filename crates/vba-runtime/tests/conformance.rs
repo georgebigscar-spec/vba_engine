@@ -19,13 +19,20 @@ fn conformance(name: &str, src: &str) {
     let lines = host.lines();
     let failures: Vec<&String> = lines.iter().filter(|l| l.starts_with("FAIL")).collect();
     if let Err(e) = result {
-        panic!("{name}: runtime error {e}\noutput so far:\n{}", lines.join("\n"));
+        panic!(
+            "{name}: runtime error {e}\noutput so far:\n{}",
+            lines.join("\n")
+        );
     }
     assert!(
         failures.is_empty(),
         "{name}: {} failed checks\n{}",
         failures.len(),
-        failures.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n")
+        failures
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
