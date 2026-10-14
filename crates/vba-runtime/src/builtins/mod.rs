@@ -19,7 +19,8 @@ pub use format::format_value;
 
 /// Built-in constants (`vbCrLf`, `vbYesNo`, ...).
 pub fn constant(name: &str) -> Option<Value> {
-    let v = match name.to_ascii_lowercase().as_str() {
+    let lname = name.to_ascii_lowercase();
+    let v = match lname.as_str() {
         "vbcrlf" | "vbnewline" => Value::str("\r\n"),
         "vbcr" => Value::str("\r"),
         "vblf" => Value::str("\n"),
@@ -62,7 +63,13 @@ pub fn constant(name: &str) -> Option<Value> {
         "vbwhite" => Value::Long(0xFFFFFF),
         "vbsunday" => Value::Integer(1),
         "vbmonday" => Value::Integer(2),
-        _ => return None,
+        _ => {
+            return strings::constant(&lname)
+                .or_else(|| conversion::constant(&lname))
+                .or_else(|| math::constant(&lname))
+                .or_else(|| datetime::constant(&lname))
+                .or_else(|| format::constant(&lname))
+        }
     };
     Some(v)
 }

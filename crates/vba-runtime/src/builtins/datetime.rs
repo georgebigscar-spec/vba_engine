@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// Constants of this library (`name` is lowercase).
+pub(super) fn constant(name: &str) -> Option<Value> {
+    let _ = name;
+    None
+}
+
 pub(super) fn call(
     lname: &str,
     name: &str,
