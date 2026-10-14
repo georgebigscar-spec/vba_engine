@@ -10,7 +10,7 @@ use vba_syntax::ast::*;
 use crate::builtins;
 use crate::class::{ClassDef, ClassInstance, ProcSet, TerminateQueue};
 use crate::debug::{DebugAction, DebugContext, DebugHook, Location, StopKind};
-use crate::errobj::ErrObject;
+use crate::errobj::{standard_error, ErrObject};
 use crate::error::{VbaError, VbaResult};
 use crate::host::Host;
 use crate::object::{same_object, Args, Collection, Invoke, ObjectRef};
@@ -38,6 +38,36 @@ pub struct Variable {
 }
 
 pub type Slot = Rc<RefCell<Variable>>;
+
+/// `Len` of a variable of a fixed-size type (or a user-defined type): its
+/// size in bytes. `None` for strings and Variants, whose `Len` is the text's.
+fn storage_len(ty: VarType, value: &Value) -> Option<i32> {
+    match value {
+        Value::Array(_) => return None,
+        Value::Udt(u) => {
+            return Some(
+                u.fields
+                    .iter()
+                    .map(|f| {
+                        storage_len(f.ty, &f.value).unwrap_or(match f.ty {
+                            VarType::Variant => 16,
+                            _ => 4,
+                        })
+                    })
+                    .sum(),
+            )
+        }
+        _ => {}
+    }
+    Some(match ty {
+        VarType::Byte => 1,
+        VarType::Boolean | VarType::Integer => 2,
+        VarType::Long | VarType::Single => 4,
+        VarType::Double | VarType::Currency | VarType::Date | VarType::LongLong => 8,
+        VarType::FixedString(n) => n as i32,
+        _ => return None,
+    })
+}
 
 fn slot(value: Value, ty: VarType) -> Slot {
     Rc::new(RefCell::new(Variable {
@@ -68,6 +98,10 @@ struct Frame {
     in_handler: bool,
     /// Block (by address) and statement index to come back to with `Resume`.
     resume_target: Option<(usize, usize)>,
+    /// `GoSub` calls waiting for their `Return`.
+    gosub_depth: usize,
+    /// The last line number (`100 x = 1`) passed, for `Erl`.
+    line_number: i64,
 }
 
 /// The object of a `With` block. A user-defined type is kept as the place
@@ -104,6 +138,8 @@ enum Flow {
     Exit(ExitKind),
     GoTo(String),
     Resume(ResumeKind),
+    /// `Return` from a `GoSub`.
+    Return,
 }
 
 pub struct Interpreter {
@@ -131,6 +167,9 @@ pub struct Interpreter {
     files: HashMap<i64, OpenFile>,
     /// The rest of the last `Dir(pattern)` search, for `Dir()`.
     dir_pending: Option<Vec<String>>,
+    /// `Static` locals by procedure (address), instance (address, 0 in a
+    /// standard module) and lower-case name.
+    statics: HashMap<(usize, usize, String), Slot>,
 }
 
 impl Interpreter {
@@ -152,6 +191,7 @@ impl Interpreter {
             print_pending: None,
             files: HashMap::new(),
             dir_pending: None,
+            statics: HashMap::new(),
         }
     }
 
@@ -185,7 +225,7 @@ impl Interpreter {
                     Some(expr) => VarType::Long.coerce(self.eval(expr)?)?,
                     None => next.clone(),
                 };
-                next = value::add(&v, &Value::Long(1))?;
+                next = value::add(&v, &Value::Long(1), false)?;
                 let s = slot(v.clone(), VarType::Long);
                 s.borrow_mut().is_const = true;
                 self.globals.push(Global {
@@ -525,16 +565,28 @@ impl Interpreter {
         let mut positional: Vec<Option<ArgSource>> = positional.into_iter().map(Some).collect();
         let mut named = named;
         let mut locals = Vec::with_capacity(proc.params.len() + 1);
+        // ParamArray elements are ByRef: variables passed in get the
+        // elements back when the procedure returns.
+        let mut param_refs: Option<(Slot, Vec<(usize, Slot)>)> = None;
         for (i, p) in proc.params.iter().enumerate() {
             if p.param_array {
+                let mut refs = Vec::new();
                 let rest: Vec<Value> = positional
                     .iter_mut()
                     .skip(i)
                     .filter_map(Option::take)
-                    .map(ArgSource::into_value)
+                    .enumerate()
+                    .map(|(k, src)| {
+                        if let ArgSource::Slot(s) = &src {
+                            refs.push((k, s.clone()));
+                        }
+                        src.into_value()
+                    })
                     .collect();
                 let arr = Value::Array(Box::new(VbArray::from_values(rest, 0)));
-                locals.push((p.name.clone(), slot(arr, VarType::Variant)));
+                let s = slot(arr, VarType::Variant);
+                param_refs = Some((s.clone(), refs));
+                locals.push((p.name.clone(), s));
                 break;
             }
             let ty = self.var_type_of(p.ty.as_ref());
@@ -586,6 +638,8 @@ impl Interpreter {
             on_error: ErrMode::Off,
             in_handler: false,
             resume_target: None,
+            gosub_depth: 0,
+            line_number: 0,
         });
         let _ = self.with_hook(|h, ctx| {
             h.on_enter(ctx);
@@ -596,6 +650,18 @@ impl Interpreter {
             Flow::Resume(_) => Err(VbaError::new(20, "Resume without error")),
             _ => Ok(()),
         });
+        if let Some((arr, refs)) = param_refs {
+            if let Value::Array(a) = &arr.borrow().value {
+                for (k, s) in refs {
+                    if let Some(v) = a.data.get(k) {
+                        let mut var = s.borrow_mut();
+                        if let Ok(v) = var.ty.coerce(v.clone()) {
+                            var.value = v;
+                        }
+                    }
+                }
+            }
+        }
         if result.is_ok() {
             result = self.before_statement(proc.end_line);
         }
@@ -649,8 +715,12 @@ impl Interpreter {
     }
 
     fn exec_block(&mut self, stmts: &[Stmt]) -> VbaResult<Flow> {
+        self.exec_block_from(stmts, 0)
+    }
+
+    /// Runs `stmts` from statement `pc` on.
+    fn exec_block_from(&mut self, stmts: &[Stmt], mut pc: usize) -> VbaResult<Flow> {
         let block_id = stmts.as_ptr() as usize;
-        let mut pc = 0;
         while pc < stmts.len() {
             match self.exec_stmt(&stmts[pc]) {
                 Ok(Flow::Normal) => pc += 1,
@@ -689,9 +759,11 @@ impl Interpreter {
                     let Some(frame) = self.frames.last_mut() else {
                         return Err(e);
                     };
+                    let line_number = frame.line_number;
                     match frame.on_error.clone() {
                         ErrMode::ResumeNext => {
                             self.err.set(&e);
+                            self.err.set_erl(line_number);
                             pc += 1;
                         }
                         ErrMode::GoTo(label) if !frame.in_handler => {
@@ -700,6 +772,7 @@ impl Interpreter {
                                     frame.in_handler = true;
                                     frame.resume_target = Some((block_id, pc));
                                     self.err.set(&e);
+                                    self.err.set_erl(line_number);
                                     pc = i;
                                 }
                                 None => return Err(e),
@@ -717,7 +790,7 @@ impl Interpreter {
         let line = stmt.span.line;
         if !matches!(
             stmt.kind,
-            StmtKind::Label(_) | StmtKind::Dim(_) | StmtKind::Const(_)
+            StmtKind::Label(_) | StmtKind::Dim(_) | StmtKind::Static(_) | StmtKind::Const(_)
         ) {
             self.before_statement(line)?;
         } else if let Some(f) = self.frame_mut() {
@@ -735,7 +808,15 @@ impl Interpreter {
 
     fn exec_stmt_kind(&mut self, kind: &StmtKind) -> VbaResult<Flow> {
         match kind {
-            StmtKind::Label(_) => {}
+            StmtKind::Label(l) => {
+                if let (Ok(n), Some(f)) = (l.parse::<i64>(), self.frame_mut()) {
+                    f.line_number = n;
+                }
+            }
+            StmtKind::Static(vars) => self.declare_static(vars)?,
+            StmtKind::Dim(vars) if self.frame().is_some_and(|f| f.procedure.is_static) => {
+                self.declare_static(vars)?
+            }
             StmtKind::Dim(vars) => {
                 for v in vars {
                     let s = self.new_var_slot(v)?;
@@ -772,7 +853,15 @@ impl Interpreter {
                                     a.redim_preserve(bounds)?;
                                 }
                             } else {
-                                let arr = self.new_array(bounds, d.ty.as_ref())?;
+                                // Without `As`, the array keeps its declared element type.
+                                let declared = match (&d.ty, &s.borrow().value) {
+                                    (None, Value::Array(a)) => Some(a.elem_type),
+                                    _ => None,
+                                };
+                                let arr = match declared {
+                                    Some(elem) => VbArray::new(bounds, elem),
+                                    None => self.new_array(bounds, d.ty.as_ref())?,
+                                };
                                 s.borrow_mut().value = Value::Array(Box::new(arr));
                             }
                         }
@@ -855,7 +944,7 @@ impl Interpreter {
                         other => return Ok(other),
                     }
                     let mut c = counter.borrow_mut();
-                    let next = value::add(&c.value, &step)?;
+                    let next = value::add(&c.value, &step, false)?;
                     c.value = c.ty.coerce(next)?;
                 }
             }
@@ -865,7 +954,7 @@ impl Interpreter {
                 body,
             } => {
                 let items = match self.eval(collection)? {
-                    Value::Array(a) => a.data,
+                    Value::Array(a) => column_major(*a),
                     Value::Object(Some(o)) => self.enumerate(&o)?,
                     Value::Object(None) => return Err(VbaError::object_not_set()),
                     _ => return Err(VbaError::new(92, "For loop not initialized")),
@@ -975,6 +1064,36 @@ impl Interpreter {
             }
             StmtKind::Resume(k) => return Ok(Flow::Resume(k.clone())),
             StmtKind::GoTo(l) => return Ok(Flow::GoTo(l.clone())),
+            StmtKind::GoSub(l) => return self.exec_gosub(l),
+            StmtKind::Return => {
+                if self.frame().is_none_or(|f| f.gosub_depth == 0) {
+                    return Err(standard_error(3));
+                }
+                return Ok(Flow::Return);
+            }
+            StmtKind::OnGoTo {
+                index,
+                labels,
+                gosub,
+            } => {
+                let v = self.eval(index)?;
+                let n = self.scalar(v)?.to_i64()?;
+                if !(0..=255).contains(&n) {
+                    return Err(VbaError::invalid_call());
+                }
+                if let Some(l) = labels.get((n as usize).wrapping_sub(1)) {
+                    return if *gosub {
+                        self.exec_gosub(l)
+                    } else {
+                        Ok(Flow::GoTo(l.clone()))
+                    };
+                }
+            }
+            StmtKind::Error(n) => {
+                let n = self.eval(n)?.to_i64()?;
+                let n = i32::try_from(n).map_err(|_| VbaError::overflow())?;
+                return Err(standard_error(n));
+            }
             StmtKind::End => return Err(VbaError::end()),
             StmtKind::RaiseEvent { name, args } => self.raise_event(name, args)?,
             StmtKind::Open { path, mode, file } => self.exec_open(path, *mode, file)?,
@@ -1047,8 +1166,9 @@ impl Interpreter {
                 .and_then(|m| m.call.clone())
             {
                 let info = sink_inst.class.info.clone();
-                let (positional, named) = self.arg_sources(args)?;
-                self.call_procedure(p, info, Some(sink.clone()), positional, named)?;
+                self.call_with_args(args, |me, positional, named| {
+                    me.call_procedure(p, info, Some(sink.clone()), positional, named)
+                })?;
             }
         }
         Ok(())
@@ -1085,6 +1205,52 @@ impl Interpreter {
                 list.push((Rc::downgrade(&me), name.to_string()));
             }
         }
+    }
+
+    /// `GoSub label`: runs the procedure body from the label until `Return`.
+    /// Reaching the end of the procedure instead ends it.
+    fn exec_gosub(&mut self, label: &str) -> VbaResult<Flow> {
+        let proc = self.frame().expect("frame").procedure.clone();
+        let start =
+            find_label(&proc.body, label).ok_or_else(|| VbaError::label_not_defined(label))?;
+        self.frame_mut().expect("frame").gosub_depth += 1;
+        let r = self.exec_block_from(&proc.body, start);
+        if let Some(f) = self.frame_mut() {
+            f.gosub_depth -= 1;
+        }
+        Ok(match r? {
+            Flow::Return => Flow::Normal,
+            Flow::Normal => Flow::Exit(ExitKind::Sub),
+            other => other,
+        })
+    }
+
+    /// `Static x` (or `Dim x` in a `Static Sub`): the variable is created on
+    /// the first call and then shared by later calls.
+    fn declare_static(&mut self, vars: &[VarDecl]) -> VbaResult<()> {
+        let Some(f) = self.frame() else {
+            return Ok(());
+        };
+        let proc = Rc::as_ptr(&f.procedure) as usize;
+        let inst =
+            f.me.as_ref()
+                .map_or(0, |o| Rc::as_ptr(o) as *const () as usize);
+        for v in vars {
+            let key = (proc, inst, v.name.to_ascii_lowercase());
+            let s = match self.statics.get(&key) {
+                Some(s) => s.clone(),
+                None => {
+                    let s = self.new_var_slot(v)?;
+                    self.statics.insert(key, s.clone());
+                    s
+                }
+            };
+            self.frame_mut()
+                .expect("frame")
+                .locals
+                .push((v.name.clone(), s));
+        }
+        Ok(())
     }
 
     fn loop_cond(&mut self, c: &LoopCond) -> VbaResult<bool> {
@@ -1345,6 +1511,12 @@ impl Interpreter {
             return Ok((VarType::Variant, self.new_udt(&def)?));
         }
         let vt = self.declared_type(t)?;
+        if t.array {
+            return Ok((
+                VarType::Variant,
+                Value::Array(Box::new(VbArray::new(vec![], vt))),
+            ));
+        }
         if t.is_new {
             return Ok((vt, self.new_object(&t.name)?));
         }
@@ -1878,8 +2050,9 @@ impl Interpreter {
             .module_procs(info, member)
             .and_then(|set| set.for_kind(&kind))
             .ok_or_else(|| Self::member_not_found(member))?;
-        let (positional, named) = self.arg_sources(args)?;
-        self.call_procedure(proc, info.clone(), None, positional, named)
+        self.call_with_args(args, |me, positional, named| {
+            me.call_procedure(proc, info.clone(), None, positional, named)
+        })
     }
 
     /// `Module1.Counter = 5`.
@@ -1918,6 +2091,14 @@ impl Interpreter {
                 v => Value::Double(v as f64),
             },
             Expr::Float(v) => Value::Double(*v),
+            Expr::Typed(v, suffix) => match suffix {
+                '%' => Value::Integer(*v as i16),
+                '&' => Value::Long(*v as i32),
+                '^' => Value::LongLong(*v as i64),
+                '!' => Value::Single(*v as f32),
+                '@' => Value::Currency((*v * 10_000.0).round() as i64),
+                _ => Value::Double(*v),
+            },
             Expr::Str(s) => Value::String(s.clone()),
             Expr::Date(s) => {
                 Value::Date(crate::date::parse_date(s).ok_or_else(VbaError::type_mismatch)?)
@@ -1946,22 +2127,30 @@ impl Interpreter {
                 self.eval_call(e, &[], Invoke::Get)?
             }
             Expr::Index(callee, args) => self.eval_call(callee, args, Invoke::Get)?,
+            Expr::Paren(a) => self.eval(a)?,
             Expr::Unary(UnOp::Neg, a) => {
+                let strict = self.static_type(a).is_some();
                 let v = self.eval(a)?;
-                value::neg(&self.scalar(v)?)?
+                value::neg(&self.scalar(v)?, strict)?
             }
             Expr::Unary(UnOp::Not, a) => {
                 let v = self.eval(a)?;
                 value::not(&self.scalar(v)?)?
             }
             Expr::Binary(op, a, b) => {
+                let fixed = match op {
+                    BinOp::Concat | BinOp::Like | BinOp::Is | BinOp::Pow => (false, false),
+                    _ => (self.static_type(a).is_some(), self.static_type(b).is_some()),
+                };
                 let (a, b) = (self.eval(a)?, self.eval(b)?);
-                self.binary(*op, a, b)?
+                self.binary(*op, a, b, fixed)?
             }
         })
     }
 
-    fn binary(&mut self, op: BinOp, a: Value, b: Value) -> VbaResult<Value> {
+    /// `fixed` says which operands have a fixed static type (see
+    /// [`Self::static_type`]).
+    fn binary(&mut self, op: BinOp, a: Value, b: Value, fixed: (bool, bool)) -> VbaResult<Value> {
         if op == BinOp::Is {
             return Ok(Value::Boolean(match (&a, &b) {
                 (Value::Object(None), Value::Object(None)) => true,
@@ -1971,39 +2160,95 @@ impl Interpreter {
             }));
         }
         let (a, b) = (self.scalar(a)?, self.scalar(b)?);
-        let text = self.text_compare();
-        Ok(match op {
-            BinOp::Add => value::add(&a, &b)?,
-            BinOp::Sub => value::sub(&a, &b)?,
-            BinOp::Mul => value::mul(&a, &b)?,
-            BinOp::Div => value::div(&a, &b)?,
-            BinOp::IntDiv => value::int_div(&a, &b)?,
-            BinOp::Mod => value::modulo(&a, &b)?,
-            BinOp::Pow => value::pow(&a, &b)?,
-            BinOp::Concat => value::concat(&a, &b)?,
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                match value::compare(&a, &b, text)? {
-                    None => Value::Null,
-                    ord => Value::Boolean(compare_op(op, ord)),
-                }
+        apply_binary(op, &a, &b, self.text_compare(), fixed)
+    }
+
+    /// The static type VBA's compiler gives an expression, which decides
+    /// whether arithmetic overflows or widens: `None` for a Variant (untyped
+    /// variables and functions, Null, Empty, object members), else the type of
+    /// a literal, a typed variable or constant, a typed function result or an
+    /// operator applied to typed operands.
+    fn static_type(&self, e: &Expr) -> Option<VarType> {
+        match e {
+            Expr::Int(v) => Some(match *v {
+                v if (i16::MIN as i64..=i16::MAX as i64).contains(&v) => VarType::Integer,
+                v if (i32::MIN as i64..=i32::MAX as i64).contains(&v) => VarType::Long,
+                _ => VarType::Double,
+            }),
+            Expr::Float(_) => Some(VarType::Double),
+            Expr::Typed(_, suffix) => Some(match suffix {
+                '%' => VarType::Integer,
+                '&' => VarType::Long,
+                '^' => VarType::LongLong,
+                '!' => VarType::Single,
+                '@' => VarType::Currency,
+                _ => VarType::Double,
+            }),
+            Expr::Str(_) => Some(VarType::String),
+            Expr::Date(_) => Some(VarType::Date),
+            Expr::Bool(_) => Some(VarType::Boolean),
+            Expr::Paren(a) => self.static_type(a),
+            Expr::Ident(name) => self.static_type_of_name(name, false),
+            Expr::Index(callee, _) => match &**callee {
+                Expr::Ident(name) => self.static_type_of_name(name, true),
+                _ => None,
+            },
+            Expr::Unary(op, a) => {
+                let v = sample_value(self.static_type(a)?);
+                let r = match op {
+                    UnOp::Neg => value::neg(&v, false),
+                    UnOp::Not => value::not(&v),
+                };
+                static_type_of_value(&r.ok()?)
             }
-            BinOp::Like => {
-                if matches!(a, Value::Null) || matches!(b, Value::Null) {
-                    Value::Null
-                } else {
-                    Value::Boolean(value::like(
-                        &a.to_string_value()?,
-                        &b.to_string_value()?,
-                        text,
-                    ))
-                }
+            Expr::Binary(BinOp::Is, ..) => Some(VarType::Boolean),
+            Expr::Binary(op, a, b) => {
+                let (ta, tb) = (self.static_type(a)?, self.static_type(b)?);
+                let r = apply_binary(
+                    *op,
+                    &sample_value(ta),
+                    &sample_value(tb),
+                    false,
+                    (true, true),
+                );
+                static_type_of_value(&r.ok()?)
             }
-            BinOp::And => value::logical(|x, y| x & y, &a, &b)?,
-            BinOp::Or => value::logical(|x, y| x | y, &a, &b)?,
-            BinOp::Xor => value::logical(|x, y| x ^ y, &a, &b)?,
-            BinOp::Eqv => value::logical(|x, y| !(x ^ y), &a, &b)?,
-            BinOp::Imp => value::logical(|x, y| !x | y, &a, &b)?,
-            BinOp::Is => unreachable!(),
+            _ => None,
+        }
+    }
+
+    /// [`Self::static_type`] of a name: a variable (an element when
+    /// `indexed`), a typed procedure or a `C...` conversion function.
+    fn static_type_of_name(&self, name: &str, indexed: bool) -> Option<VarType> {
+        let fixed = |t: VarType| match t {
+            VarType::Variant | VarType::Object => None,
+            VarType::FixedString(_) => Some(VarType::String),
+            t => Some(t),
+        };
+        if let Some(s) = self.find_slot(name) {
+            let var = s.borrow();
+            return match &var.value {
+                Value::Array(a) if indexed => fixed(a.elem_type),
+                _ if indexed => None,
+                v if var.is_const && var.ty == VarType::Variant => static_type_of_value(v),
+                _ => fixed(var.ty),
+            };
+        }
+        if let Some(proc) = self.procedure(name) {
+            return fixed(VarType::from_name(&proc.return_type.as_ref()?.name));
+        }
+        Some(match name.to_ascii_lowercase().as_str() {
+            "cbool" => VarType::Boolean,
+            "cbyte" => VarType::Byte,
+            "ccur" => VarType::Currency,
+            "cdate" => VarType::Date,
+            "cdbl" => VarType::Double,
+            "cint" => VarType::Integer,
+            "clng" => VarType::Long,
+            "clnglng" => VarType::LongLong,
+            "csng" => VarType::Single,
+            "cstr" => VarType::String,
+            _ => return None,
         })
     }
 
@@ -2034,7 +2279,15 @@ impl Interpreter {
         Ok(out)
     }
 
-    fn arg_sources(&mut self, args: &[Arg]) -> VbaResult<ArgSources> {
+    /// Calls `call` with the arguments as ByRef sources, then stores what
+    /// the callee left in array elements and fields passed ByRef back into
+    /// them.
+    fn call_with_args(
+        &mut self,
+        args: &[Arg],
+        call: impl FnOnce(&mut Self, Vec<ArgSource>, Vec<(String, ArgSource)>) -> VbaResult<Value>,
+    ) -> VbaResult<Value> {
+        let mut places = Vec::new();
         let mut positional = Vec::new();
         let mut named = Vec::new();
         for a in args {
@@ -2042,6 +2295,13 @@ impl Interpreter {
                 Some(Expr::Ident(n)) => match self.find_slot(n) {
                     Some(s) => ArgSource::Slot(s),
                     None => ArgSource::Value(self.eval(a.value.as_ref().unwrap())?),
+                },
+                Some(e @ (Expr::Index(..) | Expr::Member(..))) => match self.data_place(e)? {
+                    Some((place, s)) => {
+                        places.push((place, s.clone()));
+                        ArgSource::Slot(s)
+                    }
+                    None => ArgSource::Value(self.eval(e)?),
                 },
                 Some(e) => ArgSource::Value(self.eval(e)?),
                 None => ArgSource::Value(Value::Missing),
@@ -2051,7 +2311,79 @@ impl Interpreter {
                 None => positional.push(src),
             }
         }
-        Ok((positional, named))
+        let r = call(self, positional, named);
+        for (place, s) in places {
+            let v = s.borrow().value.clone();
+            let w = self.assign_place(&place, &mut |dst, _| {
+                *dst = v.clone();
+                Ok(())
+            });
+            if r.is_ok() {
+                w?;
+            }
+        }
+        r
+    }
+
+    /// An array element or user-defined-type field passed as an argument
+    /// (`Inc arr(1)`, `Inc p.Scores(1)`): the place with its subscripts
+    /// evaluated, and a variable holding its current value.
+    fn data_place(&mut self, e: &Expr) -> VbaResult<Option<(Expr, Slot)>> {
+        fn root(e: &Expr) -> Option<&str> {
+            match e {
+                Expr::Ident(n) => Some(n),
+                Expr::Index(b, _) | Expr::Member(b, _) => root(b),
+                _ => None,
+            }
+        }
+        let Some(name) = root(e) else {
+            return Ok(None);
+        };
+        let is_data = self
+            .find_slot(name)
+            .is_some_and(|s| matches!(s.borrow().value, Value::Array(_) | Value::Udt(_)));
+        let current_fn = self
+            .frame()
+            .is_some_and(|f| f.procedure.name.eq_ignore_ascii_case(name));
+        if !is_data || current_fn {
+            return Ok(None);
+        }
+        let place = self.freeze_place(e)?;
+        let mut current = None;
+        let read = self.assign_place(&place, &mut |v, ty| {
+            current = Some((v.clone(), ty));
+            Ok(())
+        });
+        Ok(match (read, current) {
+            (Ok(()), Some((v, ty))) if !matches!(v, Value::Object(_)) => Some((place, slot(v, ty))),
+            _ => None,
+        })
+    }
+
+    /// `e` with its subscripts evaluated, so that reading and writing it
+    /// back evaluate them once.
+    fn freeze_place(&mut self, e: &Expr) -> VbaResult<Expr> {
+        Ok(match e {
+            Expr::Index(b, args) => {
+                let mut frozen = Vec::with_capacity(args.len());
+                for a in args {
+                    let value = match &a.value {
+                        Some(v) => Some(match self.eval(v)? {
+                            Value::String(s) => Expr::Str(s),
+                            v => Expr::Int(v.to_i64()?),
+                        }),
+                        None => None,
+                    };
+                    frozen.push(Arg {
+                        name: a.name.clone(),
+                        value,
+                    });
+                }
+                Expr::Index(Box::new(self.freeze_place(b)?), frozen)
+            }
+            Expr::Member(b, f) => Expr::Member(Box::new(self.freeze_place(b)?), f.clone()),
+            e => e.clone(),
+        })
     }
 
     /// Evaluates `callee(args)`: array indexing, procedure call, built-in,
@@ -2093,19 +2425,40 @@ impl Interpreter {
                         .downcast_ref::<ClassInstance>()
                         .expect("class instance");
                     if inst.class.members.contains_key(&name.to_ascii_lowercase()) {
-                        let (positional, named) = self.arg_sources(args)?;
-                        return self.call_member(&me, name, kind, positional, named);
+                        return self.call_with_args(args, |this, positional, named| {
+                            this.call_member(&me, name, kind, positional, named)
+                        });
                     }
                 }
                 if let Some((proc, module)) = self
                     .lookup_proc(name)
                     .and_then(|(set, m)| set.for_kind(&Invoke::Get).map(|p| (p, m)))
                 {
-                    let (positional, named) = self.arg_sources(args)?;
-                    return self.call_procedure(proc, module, None, positional, named);
+                    return self.call_with_args(args, |me, positional, named| {
+                        me.call_procedure(proc, module, None, positional, named)
+                    });
                 }
                 if name.eq_ignore_ascii_case("err") {
                     return self.index_value(Value::from(self.err.clone()), args, kind);
+                }
+                // `Len(x)` of a typed variable is its storage size.
+                if let (
+                    [Arg {
+                        name: None,
+                        value: Some(Expr::Ident(v)),
+                    }],
+                    true,
+                ) = (args, name.eq_ignore_ascii_case("len"))
+                {
+                    if let Some(s) = self.find_slot(v) {
+                        let var = s.borrow();
+                        if let Some(n) = storage_len(var.ty, &var.value) {
+                            return Ok(Value::Long(n));
+                        }
+                    }
+                }
+                if name.eq_ignore_ascii_case("erl") && args.is_empty() {
+                    return Ok(Value::Long(self.err.erl() as i32));
                 }
                 let mut evaluated = self.eval_args(args)?;
                 if let Some(r) = self.file_builtin(name, &evaluated) {
@@ -2209,8 +2562,9 @@ impl Interpreter {
     ) -> VbaResult<Value> {
         if o.as_any().is::<ClassInstance>() {
             // VBA class methods get ByRef arguments.
-            let (positional, named) = self.arg_sources(args)?;
-            return self.call_member(o, member, kind, positional, named);
+            return self.call_with_args(args, |me, positional, named| {
+                me.call_member(o, member, kind, positional, named)
+            });
         }
         let evaluated = self.eval_args(args)?;
         o.invoke(member, kind, evaluated)
@@ -2247,9 +2601,6 @@ impl Drop for Interpreter {
     }
 }
 
-/// Positional and named argument sources of a call.
-type ArgSources = (Vec<ArgSource>, Vec<(String, ArgSource)>);
-
 enum ArgSource {
     Slot(Slot),
     Value(Value),
@@ -2262,6 +2613,77 @@ impl ArgSource {
             ArgSource::Value(v) => v,
         }
     }
+}
+
+/// Applies a binary operator other than `Is` to scalar operands; `fixed`
+/// says which operands have a fixed static type.
+fn apply_binary(
+    op: BinOp,
+    a: &Value,
+    b: &Value,
+    text: bool,
+    fixed: (bool, bool),
+) -> VbaResult<Value> {
+    let strict = fixed.0 && fixed.1;
+    Ok(match op {
+        BinOp::Add => value::add(a, b, strict)?,
+        BinOp::Sub => value::sub(a, b, strict)?,
+        BinOp::Mul => value::mul(a, b, strict)?,
+        BinOp::Div => value::div(a, b, strict)?,
+        BinOp::IntDiv => value::int_div(a, b, strict)?,
+        BinOp::Mod => value::modulo(a, b, strict)?,
+        BinOp::Pow => value::pow(a, b)?,
+        BinOp::Concat => value::concat(a, b)?,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            match value::compare_typed(a, b, text, fixed)? {
+                None => Value::Null,
+                ord => Value::Boolean(compare_op(op, ord)),
+            }
+        }
+        BinOp::Like => {
+            if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                Value::Null
+            } else {
+                Value::Boolean(value::like_op(
+                    &a.to_string_value()?,
+                    &b.to_string_value()?,
+                    text,
+                )?)
+            }
+        }
+        BinOp::And => value::logical(|x, y| x & y, a, b)?,
+        BinOp::Or => value::logical(|x, y| x | y, a, b)?,
+        BinOp::Xor => value::logical(|x, y| x ^ y, a, b)?,
+        BinOp::Eqv => value::logical(|x, y| !(x ^ y), a, b)?,
+        BinOp::Imp => value::logical(|x, y| !x | y, a, b)?,
+        BinOp::Is => return Err(VbaError::object_required()),
+    })
+}
+
+/// A value of the given fixed type, for working out an operator's result
+/// type in [`Interpreter::static_type`].
+fn sample_value(t: VarType) -> Value {
+    match t {
+        VarType::Boolean => Value::Boolean(true),
+        VarType::String | VarType::FixedString(_) => Value::str("1"),
+        t => t.coerce(Value::Integer(1)).unwrap_or_default(),
+    }
+}
+
+fn static_type_of_value(v: &Value) -> Option<VarType> {
+    Some(match v {
+        Value::Boolean(_) => VarType::Boolean,
+        Value::Byte(_) => VarType::Byte,
+        Value::Integer(_) => VarType::Integer,
+        Value::Long(_) => VarType::Long,
+        Value::LongLong(_) => VarType::LongLong,
+        Value::Single(_) => VarType::Single,
+        Value::Double(_) => VarType::Double,
+        Value::Currency(_) => VarType::Currency,
+        Value::Date(_) => VarType::Date,
+        Value::String(_) => VarType::String,
+        _ => return None,
+    })
 }
 
 fn truthy(v: &Value) -> VbaResult<bool> {
@@ -2286,6 +2708,32 @@ fn compare_op(op: BinOp, ord: Option<Ordering>) -> bool {
 
 fn indices(args: &Args) -> VbaResult<Vec<i64>> {
     args.positional.iter().map(|v| v.to_i64()).collect()
+}
+
+/// Array elements in `For Each` order: the first index varies fastest.
+fn column_major(a: VbArray) -> Vec<Value> {
+    if a.bounds.len() < 2 {
+        return a.data;
+    }
+    let dims: Vec<usize> = a
+        .bounds
+        .iter()
+        .map(|(l, u)| (u - l + 1).max(0) as usize)
+        .collect();
+    let mut idx = vec![0usize; dims.len()];
+    let mut out = Vec::with_capacity(a.data.len());
+    for _ in 0..a.data.len() {
+        let off = idx.iter().zip(&dims).fold(0, |o, (i, d)| o * d + i);
+        out.push(a.data[off].clone());
+        for (i, d) in idx.iter_mut().zip(&dims) {
+            *i += 1;
+            if *i < *d {
+                break;
+            }
+            *i = 0;
+        }
+    }
+    out
 }
 
 fn find_label(stmts: &[Stmt], label: &str) -> Option<usize> {

@@ -11,6 +11,9 @@ pub enum Tok {
     Keyword(Kw),
     Int(i64),
     Float(f64),
+    /// A numeric literal whose type is fixed by a suffix (`%&^!#@`) or by
+    /// hex/octal notation; the char is the suffix.
+    Typed(f64, char),
     Str(String),
     Date(String),
     Op(&'static str),
@@ -171,6 +174,15 @@ fn looks_like_date(rest: &[char]) -> bool {
             .all(|&c| c.is_alphanumeric() || matches!(c, '/' | ':' | '-' | ' ' | ',' | '.'))
 }
 
+/// `word` with the type suffix `last` (the character that ended the
+/// identifier) appended, unless it is not a suffix or already there.
+fn with_suffix(mut word: String, last: char) -> String {
+    if matches!(last, '$' | '%' | '#' | '@') && !word.ends_with(last) {
+        word.push(last);
+    }
+    word
+}
+
 pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
     let chars: Vec<char> = src.chars().collect();
     let mut out = Vec::new();
@@ -307,12 +319,25 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
                 let v = i64::from_str_radix(&digits, radix).map_err(|_| {
                     SyntaxError::new("invalid radix literal", Span { line: sl, col: sc })
                 })?;
-                if matches!(chars.get(j), Some('&' | '%')) {
-                    j += 1;
-                }
+                // `&HFFFF` is Integer -1 and `&HFFFFFFFF` Long -1: radix
+                // literals wrap to the smallest type that holds their bits.
+                let suffix = match chars.get(j) {
+                    Some(&c @ ('%' | '&' | '^')) => {
+                        j += 1;
+                        c
+                    }
+                    _ if v <= 0xFFFF => '%',
+                    _ if v <= 0xFFFF_FFFF => '&',
+                    _ => '^',
+                };
+                let v = match suffix {
+                    '%' => v as u16 as i16 as f64,
+                    '&' => v as u32 as i32 as f64,
+                    _ => v as f64,
+                };
                 col += (j - i) as u32;
                 i = j;
-                push!(Tok::Int(v), sl, sc);
+                push!(Tok::Typed(v, suffix), sl, sc);
             }
             c if c.is_ascii_digit()
                 || (c == '.' && chars.get(i + 1).is_some_and(|d| d.is_ascii_digit())) =>
@@ -338,15 +363,20 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
                 }
                 let text: String = chars[i..j].iter().collect();
                 // Type suffixes: % & ^ (integral) and ! # @ (floating).
-                match chars.get(j) {
-                    Some('!' | '#' | '@') => {
-                        is_float = true;
-                        j += 1;
-                    }
-                    Some('%' | '&' | '^') if !is_float => j += 1,
-                    _ => {}
-                }
-                let tok = if is_float {
+                let suffix = match chars.get(j) {
+                    Some(&c @ ('!' | '#' | '@')) => Some(c),
+                    Some(&c @ ('%' | '&' | '^')) if !is_float => Some(c),
+                    _ => None,
+                };
+                let tok = if let Some(c) = suffix {
+                    j += 1;
+                    Tok::Typed(
+                        text.parse().map_err(|_| {
+                            SyntaxError::new("invalid number", Span { line: sl, col: sc })
+                        })?,
+                        c,
+                    )
+                } else if is_float {
                     Tok::Float(text.parse().map_err(|_| {
                         SyntaxError::new("invalid number", Span { line: sl, col: sc })
                     })?)
@@ -365,10 +395,14 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
                 while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
                     j += 1;
                 }
-                let word: String = chars[i..j].iter().collect();
-                // Identifier type suffixes ($ % # @) are accepted and dropped
-                // (`Left$` == `Left`). `&` and `!` stay operators.
+                let mut word: String = chars[i..j].iter().collect();
+                // Identifier type suffixes ($ % # @) are accepted and dropped,
+                // except `$` on string built-ins (`Left$` raises 94 on Null
+                // where `Left` returns Null). `&` and `!` stay operators.
                 if matches!(chars.get(j), Some('$' | '%' | '#' | '@')) {
+                    if chars[j] == '$' && keeps_dollar(&word) {
+                        word.push('$');
+                    }
                     j += 1;
                 }
                 col += (j - i) as u32;
@@ -381,7 +415,9 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
                 }
                 match Kw::lookup(&word) {
                     Some(kw) => push!(Tok::Keyword(kw), sl, sc),
-                    None => push!(Tok::Ident(word), sl, sc),
+                    // The suffix goes to the parser, which reads it in
+                    // declarations (`Dim h$`) and strips it from the name.
+                    None => push!(Tok::Ident(with_suffix(word, chars[i - 1])), sl, sc),
                 }
             }
             _ => {
@@ -410,6 +446,32 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
         span: Span { line, col },
     });
     Ok(out)
+}
+
+/// Built-in functions whose `$` form (`Left$`) differs from the plain one,
+/// so the lexer keeps the `$` in their identifier.
+pub fn keeps_dollar(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "left"
+            | "date"
+            | "time"
+            | "right"
+            | "mid"
+            | "ucase"
+            | "lcase"
+            | "trim"
+            | "ltrim"
+            | "rtrim"
+            | "space"
+            | "string"
+            | "chr"
+            | "chrw"
+            | "hex"
+            | "oct"
+            | "str"
+            | "format"
+    )
 }
 
 #[cfg(test)]
@@ -444,7 +506,10 @@ mod tests {
     #[test]
     fn keywords_are_case_insensitive() {
         assert_eq!(toks("DIM")[0], Tok::Keyword(Kw::Dim));
-        assert_eq!(toks("&HFF")[0], Tok::Int(255));
+        assert_eq!(toks("&HFF")[0], Tok::Typed(255.0, '%'));
+        assert_eq!(toks("&HFFFF")[0], Tok::Typed(-1.0, '%'));
+        assert_eq!(toks("&HFFFF&")[0], Tok::Typed(65535.0, '&'));
+        assert_eq!(toks("2@")[0], Tok::Typed(2.0, '@'));
         assert_eq!(toks("1.5E2")[0], Tok::Float(150.0));
     }
 }

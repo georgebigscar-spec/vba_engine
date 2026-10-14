@@ -45,7 +45,8 @@ pub fn to_cell_value(v: Value) -> Value {
         | Value::Long(_)
         | Value::LongLong(_)
         | Value::Single(_)
-        | Value::Currency(_) => Value::Double(v.to_f64().unwrap_or(0.0)),
+        | Value::Currency(_)
+        | Value::Decimal(_) => Value::Double(v.to_f64().unwrap_or(0.0)),
         Value::Null | Value::Missing => Value::Empty,
         other => other,
     }

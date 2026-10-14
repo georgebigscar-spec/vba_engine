@@ -38,14 +38,19 @@
 ## Система типов (`value.rs`)
 
 `Value` = VBA Variant: `Empty, Null, Boolean, Byte, Integer(i16), Long(i32),
-LongLong(i64), Single, Double, Currency(i64 ×10⁴), Date(f64 OLE),
-String, Object(Option<ObjectRef>) (None = Nothing), Array, Error, Missing`.
+LongLong(i64), Single, Double, Currency(i64 ×10⁴), Decimal (rust_decimal),
+Date(f64 OLE), String, Object(Option<ObjectRef>) (None = Nothing), Array, Error, Missing`.
 
 - Объявленный тип (`Dim x As Long`) хранится в слоте переменной; присваивание
   приводит значение через `VarType::coerce` (банковское округление, Overflow = ошибка 6).
-- Арифметика Variant расширяет тип при переполнении (Integer → Long → LongLong → Double),
-  `+` на двух строках — конкатенация, `/` всегда Double, `\` и `Mod` — целочисленные.
-- `Null` распространяется через операторы, в `If` считается False.
+- Интерпретатор выводит статический тип операндов (литералы с суффиксами
+  `% & ^ ! # @`, типизированные переменные, `CInt()` и т. п.). Если оба операнда
+  типизированы, переполнение — ошибка 6 (`Dim i As Integer: i = 32767: i + 1`);
+  если хоть один Variant, тип расширяется (Byte → Integer → Long → Double).
+- `+` на двух строках — конкатенация, `/` — Double (Single для Single),
+  `\` и `Mod` округляют операнды до Long по-банковски.
+- `Null` распространяется через операторы; `And/Or/Imp` с Null — трёхзначная
+  логика (`False And Null` = False). Число Variant всегда меньше строки Variant.
 - Массивы — значения (копируются при присваивании), многомерные, с произвольными
   нижними границами, `ReDim Preserve`.
 - `CStr(Double)` — 15 значащих цифр как в VBA (`0.1 + 0.2` → `0.3`).
@@ -250,6 +255,23 @@ Watch: `Expression`, `BreakWhenTrue`, `BreakWhenChanged`, с ограничен�
 ячейкам; `Union` несмежных диапазонов приближается охватывающим прямоугольником;
 нет `Names`, `ListObjects`, `Charts`, событий листа.
 
+### Встроенные функции (`builtins/`)
+
+Разбиты по библиотекам VBA: `strings.rs`, `conversion.rs` (+ Information),
+`math.rs` (+ финансовые `Pmt`, `IRR`, `NPV`…), `datetime.rs`, `format.rs`
+(`Format` целиком: секции, литералы, именованные форматы, маски дат,
+`FormatNumber/Currency/Percent/DateTime`). Формы с `$` (`Left$`) возвращают
+String и дают ошибку 94 на Null. `Rnd`/`Randomize` — настоящий 24-битный
+генератор VBA, последовательности совпадают с Office.
+
+### Тесты соответствия (`tests/vba/*.bas`)
+
+Около 2000 проверок, написанных на самом VBA: `Check`, `CheckTyped`,
+`CheckErr` из `Assert.bas`. Ожидаемые значения взяты из примеров справочника
+VBA от Microsoft (MicrosoftDocs/VBA-Docs, код под MIT) и из известного
+поведения VBA 7 (en-US). `tests/conformance.rs` запускает каждый файл отдельным
+тестом. Чтобы добавить проверку, достаточно дописать строку в нужный `.bas`.
+
 ### `Debug.Print`
 
 Печать как в VBA: числа с пробелом под знак впереди и пробелом после,
@@ -265,8 +287,7 @@ Watch: `Expression`, `BreakWhenTrue`, `BreakWhenChanged`, с ограничен�
 4. **Компиляция в байткод** вместо tree-walking: даст `Set Next Statement`
    (Ctrl+F9), точный `Resume Next` для ошибок внутри вложенных блоков,
    отладку без рекурсии Rust-стека и скорость.
-5. **Семантика ближе к VBA**: сравнение Variant-строки с числом,
-   локаль для дат/чисел, `Format` целиком, `Decimal`.
+5. **Семантика ближе к VBA**: локаль для дат/чисел (сейчас en-US).
 6. **Хосты**: мок Excel дальше (вычисление формул, `Find`, `Sort`,
    `AutoFilter`, `Names`), COM-мост на Windows (`IDispatch` через `windows-rs`)
    для запуска тех же макросов в настоящем Excel.
