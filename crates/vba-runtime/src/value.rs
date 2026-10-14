@@ -4,6 +4,9 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::rc::Rc;
 
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::{Decimal, RoundingStrategy};
+
 use crate::error::{VbaError, VbaResult};
 use crate::object::ObjectRef;
 
@@ -23,6 +26,8 @@ pub enum Value {
     Double(f64),
     /// Fixed-point, scaled by 10 000.
     Currency(i64),
+    /// `CDec(x)`: a 96-bit integer scaled by a power of ten (0 to 28).
+    Decimal(Decimal),
     /// OLE Automation date: days since 1899-12-30, fraction = time of day.
     Date(f64),
     String(String),
@@ -79,6 +84,8 @@ pub enum VarType {
     Single,
     Double,
     Currency,
+    /// Only a Variant can hold one (`CDec`); never a declared type.
+    Decimal,
     Date,
     String,
     /// `String * N`: always exactly N characters.
@@ -117,6 +124,7 @@ impl VarType {
             VarType::Single => Value::Single(0.0),
             VarType::Double => Value::Double(0.0),
             VarType::Currency => Value::Currency(0),
+            VarType::Decimal => Value::Decimal(Decimal::ZERO),
             VarType::Date => Value::Date(0.0),
             VarType::String => Value::String(String::new()),
             VarType::FixedString(n) => Value::String("\0".repeat(n as usize)),
@@ -129,19 +137,32 @@ impl VarType {
         Ok(match self {
             VarType::Variant => v,
             VarType::Boolean => Value::Boolean(v.to_bool()?),
-            VarType::Byte => Value::Byte(
-                u8::try_from(round_even_i64(v.to_f64()?)?).map_err(|_| VbaError::overflow())?,
-            ),
-            VarType::Integer => Value::Integer(
-                i16::try_from(round_even_i64(v.to_f64()?)?).map_err(|_| VbaError::overflow())?,
-            ),
-            VarType::Long => Value::Long(
-                i32::try_from(round_even_i64(v.to_f64()?)?).map_err(|_| VbaError::overflow())?,
-            ),
+            VarType::Byte => {
+                Value::Byte(u8::try_from(v.to_i64()?).map_err(|_| VbaError::overflow())?)
+            }
+            VarType::Integer => {
+                Value::Integer(i16::try_from(v.to_i64()?).map_err(|_| VbaError::overflow())?)
+            }
+            VarType::Long => {
+                Value::Long(i32::try_from(v.to_i64()?).map_err(|_| VbaError::overflow())?)
+            }
             VarType::LongLong => Value::LongLong(v.to_i64()?),
-            VarType::Single => Value::Single(v.to_f64()? as f32),
+            VarType::Single => {
+                let x = v.to_f64()? as f32;
+                if !x.is_finite() {
+                    return Err(VbaError::overflow());
+                }
+                Value::Single(x)
+            }
             VarType::Double => Value::Double(v.to_f64()?),
-            VarType::Currency => Value::Currency((v.to_f64()? * 10_000.0).round_ties_even() as i64),
+            VarType::Currency => Value::Currency(match v {
+                Value::Decimal(d) => (d * Decimal::from(10_000))
+                    .round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven)
+                    .to_i64()
+                    .ok_or_else(VbaError::overflow)?,
+                v => currency_units(v.to_f64()?)?,
+            }),
+            VarType::Decimal => Value::Decimal(v.to_decimal()?),
             VarType::Date => Value::Date(v.to_date()?),
             VarType::String => Value::String(v.to_string_value()?),
             VarType::FixedString(n) => {
@@ -255,6 +276,7 @@ impl Value {
                 | Value::Single(_)
                 | Value::Double(_)
                 | Value::Currency(_)
+                | Value::Decimal(_)
                 | Value::Boolean(_)
                 | Value::Date(_)
                 | Value::Empty
@@ -274,6 +296,7 @@ impl Value {
             Value::Single(_) => "Single".into(),
             Value::Double(_) => "Double".into(),
             Value::Currency(_) => "Currency".into(),
+            Value::Decimal(_) => "Decimal".into(),
             Value::Date(_) => "Date".into(),
             Value::String(_) => "String".into(),
             Value::Object(None) => "Nothing".into(),
@@ -301,9 +324,10 @@ impl Value {
             Value::Error(_) | Value::Missing => 10,
             Value::Udt(_) => 36,
             Value::Boolean(_) => 11,
+            Value::Decimal(_) => 14,
             Value::Byte(_) => 17,
             Value::LongLong(_) => 20,
-            Value::Array(_) => 8192 + 12,
+            Value::Array(a) => 8192 + a.elem_type.code(),
         }
     }
 
@@ -326,6 +350,7 @@ impl Value {
             Value::Single(v) => *v as f64,
             Value::Double(v) | Value::Date(v) => *v,
             Value::Currency(v) => *v as f64 / 10_000.0,
+            Value::Decimal(d) => d.to_f64().unwrap_or_default(),
             Value::String(s) => parse_number(s).ok_or_else(VbaError::type_mismatch)?,
             Value::Null => return Err(VbaError::invalid_use_of_null()),
             Value::Object(Some(o)) => return o.default_value()?.to_f64(),
@@ -340,8 +365,37 @@ impl Value {
             Value::Integer(v) => Ok(*v as i64),
             Value::Long(v) => Ok(*v as i64),
             Value::LongLong(v) => Ok(*v),
+            Value::Decimal(d) => d
+                .round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven)
+                .to_i64()
+                .ok_or_else(VbaError::overflow),
             other => round_even_i64(other.to_f64()?),
         }
+    }
+
+    /// `CDec` semantics: exact for integers, Currency and numeric strings;
+    /// Single and Double keep their 7 and 15 significant digits.
+    pub fn to_decimal(&self) -> VbaResult<Decimal> {
+        let from_float = |x: f64, digits: u32| {
+            Decimal::from_f64(x)
+                .and_then(|d| d.round_sf(digits))
+                .map(|d| d.normalize())
+                .ok_or_else(VbaError::overflow)
+        };
+        Ok(match self {
+            Value::Decimal(d) => *d,
+            Value::Byte(v) => Decimal::from(*v),
+            Value::Integer(v) => Decimal::from(*v),
+            Value::Long(v) => Decimal::from(*v),
+            Value::LongLong(v) => Decimal::from(*v),
+            Value::Currency(v) => Decimal::new(*v, 4).normalize(),
+            Value::Single(v) => from_float(*v as f64, 7)?,
+            Value::String(s) => match parse_decimal(s) {
+                Some(d) => d,
+                None => from_float(self.to_f64()?, 15)?,
+            },
+            other => from_float(other.to_f64()?, 15)?,
+        })
     }
 
     pub fn to_bool(&self) -> VbaResult<bool> {
@@ -399,7 +453,8 @@ impl Value {
             Value::Single(_) => 4,
             Value::Double(_) | Value::String(_) => 5,
             Value::Currency(_) => 6,
-            Value::Date(_) => 7,
+            Value::Decimal(_) => 7,
+            Value::Date(_) => 8,
             _ => 5,
         }
     }
@@ -417,10 +472,40 @@ impl VarType {
             VarType::Single => "Single",
             VarType::Double => "Double",
             VarType::Currency => "Currency",
+            VarType::Decimal => "Decimal",
             VarType::Date => "Date",
             VarType::String | VarType::FixedString(_) => "String",
             VarType::Object => "Object",
         }
+    }
+
+    /// The `VarType` code of a value of this type (`vbInteger`, ...).
+    fn code(self) -> i32 {
+        match self {
+            VarType::Integer => 2,
+            VarType::Long => 3,
+            VarType::Single => 4,
+            VarType::Double => 5,
+            VarType::Currency => 6,
+            VarType::Date => 7,
+            VarType::String | VarType::FixedString(_) => 8,
+            VarType::Object => 9,
+            VarType::Boolean => 11,
+            VarType::Variant => 12,
+            VarType::Decimal => 14,
+            VarType::Byte => 17,
+            VarType::LongLong => 20,
+        }
+    }
+}
+
+/// A Double as Currency units (scaled by 10 000), Overflow when out of range.
+fn currency_units(x: f64) -> VbaResult<i64> {
+    let c = (x * 10_000.0).round_ties_even();
+    if c.is_finite() && c.abs() < i64::MAX as f64 {
+        Ok(c as i64)
+    } else {
+        Err(VbaError::overflow())
     }
 }
 
@@ -433,26 +518,89 @@ pub(crate) fn round_even_i64(f: f64) -> VbaResult<i64> {
     }
 }
 
-/// Parses a numeric string the way `Val`-less coercion does (`" 12.5 "`, `"&HFF"`).
+/// Parses a numeric string the way `Val`-less coercion does (`" 12.5 "`,
+/// `"1,234.5"`, `"&HFF"`, `"&O17"`).
 pub fn parse_number(s: &str) -> Option<f64> {
     let t = s.trim();
-    if t.is_empty() {
-        return None;
+    if let Some(v) = parse_radix(t) {
+        return v.map(|v| v as f64);
     }
-    if let Some(hex) = t.strip_prefix("&H").or_else(|| t.strip_prefix("&h")) {
-        return i64::from_str_radix(hex, 16).ok().map(|v| v as f64);
+    number_text(t)?
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+}
+
+/// [`parse_number`] keeping every digit, for `CDec`.
+pub fn parse_decimal(s: &str) -> Option<Decimal> {
+    let t = s.trim();
+    if let Some(v) = parse_radix(t) {
+        return v.map(Decimal::from);
     }
-    t.parse::<f64>().ok().filter(|v| v.is_finite())
+    let t = number_text(t)?;
+    if t.contains(['e', 'E']) {
+        Decimal::from_scientific(&t).ok()
+    } else {
+        t.parse().ok()
+    }
+}
+
+/// A `&H` / `&O` (or bare `&`) prefixed integer, `None` when `t` has no such
+/// prefix. Like a literal, a value that fits 16 (or 32) bits wraps to a
+/// negative Integer (Long) unless a `&` suffix asks for a Long.
+pub(crate) fn parse_radix(t: &str) -> Option<Option<i64>> {
+    let rest = t.strip_prefix('&')?;
+    let (radix, digits) = match rest.chars().next() {
+        Some('h' | 'H') => (16, &rest[1..]),
+        Some('o' | 'O') => (8, &rest[1..]),
+        _ => (8, rest),
+    };
+    let (digits, long) = match digits.strip_suffix('&') {
+        Some(d) => (d, true),
+        None => (digits, false),
+    };
+    Some(u64::from_str_radix(digits, radix).ok().map(|v| match v {
+        0..=0xFFFF if !long => v as u16 as i16 as i64,
+        0..=0xFFFF_FFFF => v as u32 as i32 as i64,
+        _ => v as i64,
+    }))
+}
+
+/// The numeric text `t` with thousands separators removed, or `None` if a
+/// comma is out of place.
+fn number_text(t: &str) -> Option<String> {
+    if !t.contains(',') {
+        return Some(t.to_string());
+    }
+    let mut out = String::with_capacity(t.len());
+    let mut prev_digit = false;
+    for c in t.chars() {
+        if c == ',' {
+            if !prev_digit || out.contains(['.', 'e', 'E']) {
+                return None;
+            }
+        } else {
+            out.push(c);
+            prev_digit = c.is_ascii_digit();
+        }
+    }
+    Some(out)
 }
 
 /// Formats a double with 15 significant digits like VBA's `CStr`.
 pub fn format_double(v: f64) -> String {
+    format_float(v, 15)
+}
+
+/// Formats a number with `digits` significant digits (15 for a Double, 7 for
+/// a Single), in E notation outside `1E-digits..1E+digits`.
+fn format_float(v: f64, digits: i32) -> String {
     if v == 0.0 {
         return "0".into();
     }
-    let rounded: f64 = format!("{v:.14e}").parse().unwrap_or(v);
+    let rounded: f64 = format!("{v:.*e}", digits as usize - 1).parse().unwrap_or(v);
     let abs = rounded.abs();
-    if !(1e-15..1e15).contains(&abs) {
+    if !(10f64.powi(-digits)..10f64.powi(digits)).contains(&abs) {
         let s = format!("{rounded:e}");
         let (m, e) = s.split_once('e').unwrap();
         let exp: i32 = e.parse().unwrap();
@@ -471,9 +619,10 @@ impl fmt::Display for Value {
             Value::Integer(v) => write!(f, "{v}"),
             Value::Long(v) => write!(f, "{v}"),
             Value::LongLong(v) => write!(f, "{v}"),
-            Value::Single(v) => write!(f, "{}", format_double(*v as f64)),
+            Value::Single(v) => write!(f, "{}", format_float(*v as f64, 7)),
             Value::Double(v) => write!(f, "{}", format_double(*v)),
             Value::Currency(v) => write!(f, "{}", format_double(*v as f64 / 10_000.0)),
+            Value::Decimal(d) => write!(f, "{}", d.normalize()),
             Value::Date(d) => write!(f, "{}", crate::date::format_date(*d)),
             Value::String(s) => write!(f, "{s}"),
             Value::Object(None) => write!(f, "Nothing"),
@@ -569,7 +718,7 @@ fn int_result(v: i128, rank: u8, strict: bool) -> VbaResult<Value> {
 }
 
 /// Builds a floating result of the given rank (4 Single, 5 Double,
-/// 6 Currency, 7 Date); a Variant Single that overflows becomes a Double.
+/// 6 Currency, 8 Date); a Variant Single that overflows becomes a Double.
 fn float_result(v: f64, rank: u8, strict: bool) -> VbaResult<Value> {
     if !v.is_finite() {
         return Err(VbaError::overflow());
@@ -577,16 +726,21 @@ fn float_result(v: f64, rank: u8, strict: bool) -> VbaResult<Value> {
     Ok(match rank {
         4 if (v as f32).is_finite() => Value::Single(v as f32),
         4 if strict => return Err(VbaError::overflow()),
-        6 => {
-            let c = (v * 10_000.0).round_ties_even();
-            if c.abs() >= i64::MAX as f64 {
-                return Err(VbaError::overflow());
-            }
-            Value::Currency(c as i64)
-        }
-        7 => Value::Date(v),
+        6 => Value::Currency(currency_units(v)?),
+        8 => Value::Date(v),
         _ => Value::Double(v),
     })
+}
+
+/// The result rank of an arithmetic operator (see [`Value::numeric_rank`]):
+/// the wider operand, except that Long or LongLong with Single and Currency
+/// with Single or Double give Double.
+fn arith_rank(a: &Value, b: &Value) -> u8 {
+    let (ra, rb) = (a.numeric_rank(), b.numeric_rank());
+    match (ra.max(rb), ra.min(rb)) {
+        (4, 2..=3) | (6, 4..=5) => 5,
+        (r, _) => r,
+    }
 }
 
 fn arith(
@@ -595,23 +749,22 @@ fn arith(
     strict: bool,
     int_op: fn(i128, i128) -> i128,
     float_op: fn(f64, f64) -> f64,
+    dec_op: fn(Decimal, Decimal) -> Option<Decimal>,
 ) -> VbaResult<Value> {
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
         return Ok(Value::Null);
     }
     let (a, b) = (a.clone().into_scalar()?, b.clone().into_scalar()?);
-    let (ra, rb) = (a.numeric_rank(), b.numeric_rank());
-    // Long or LongLong with Single gives Double.
-    let rank = match (ra.max(rb), ra.min(rb)) {
-        (4, 2..=3) => 5,
-        (r, _) => r,
-    };
+    let rank = arith_rank(&a, &b);
     match rank {
         0..=3 => int_result(
             int_op(a.to_i64()? as i128, b.to_i64()? as i128),
             rank,
             strict,
         ),
+        7 => dec_op(a.to_decimal()?, b.to_decimal()?)
+            .map(Value::Decimal)
+            .ok_or_else(VbaError::overflow),
         _ => float_result(float_op(a.to_f64()?, b.to_f64()?), rank, strict),
     }
 }
@@ -623,7 +776,14 @@ pub fn add(a: &Value, b: &Value, strict: bool) -> VbaResult<Value> {
         (Value::Empty, Value::String(s)) | (Value::String(s), Value::Empty) => {
             Ok(Value::String(s.clone()))
         }
-        _ => arith(a, b, strict, |x, y| x + y, |x, y| x + y),
+        _ => arith(
+            a,
+            b,
+            strict,
+            |x, y| x + y,
+            |x, y| x + y,
+            |x, y| x.checked_add(y),
+        ),
     }
 }
 
@@ -632,15 +792,30 @@ pub fn sub(a: &Value, b: &Value, strict: bool) -> VbaResult<Value> {
     if let (Value::Date(x), Value::Date(y)) = (a, b) {
         return Ok(Value::Double(x - y));
     }
-    arith(a, b, strict, |x, y| x - y, |x, y| x - y)
+    arith(
+        a,
+        b,
+        strict,
+        |x, y| x - y,
+        |x, y| x - y,
+        |x, y| x.checked_sub(y),
+    )
 }
 
 pub fn mul(a: &Value, b: &Value, strict: bool) -> VbaResult<Value> {
-    arith(a, b, strict, |x, y| x * y, |x, y| x * y)
+    arith(
+        a,
+        b,
+        strict,
+        |x, y| x * y,
+        |x, y| x * y,
+        |x, y| x.checked_mul(y),
+    )
 }
 
-/// `/`: a Double, or a Single when a Single meets nothing wider than Integer.
-/// `0 / 0` is Overflow, any other division by zero is error 11.
+/// `/`: a Double, a Decimal when either operand is one, or a Single when a
+/// Single meets nothing wider than Integer. `0 / 0` is Overflow, any other
+/// division by zero is error 11.
 pub fn div(a: &Value, b: &Value, strict: bool) -> VbaResult<Value> {
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
         return Ok(Value::Null);
@@ -654,6 +829,13 @@ pub fn div(a: &Value, b: &Value, strict: bool) -> VbaResult<Value> {
         });
     }
     let (ra, rb) = (a.numeric_rank(), b.numeric_rank());
+    if ra.max(rb) == 7 {
+        return a
+            .to_decimal()?
+            .checked_div(b.to_decimal()?)
+            .map(|d| Value::Decimal(d.normalize()))
+            .ok_or_else(VbaError::overflow);
+    }
     let single = ra.max(rb) == 4 && ![ra, rb].iter().any(|r| (2..=3).contains(r));
     float_result(x / y, if single { 4 } else { 5 }, strict)
 }
@@ -748,6 +930,7 @@ pub fn neg(a: &Value, strict: bool) -> VbaResult<Value> {
         Value::Currency(v) => Ok(Value::Currency(
             v.checked_neg().ok_or_else(VbaError::overflow)?,
         )),
+        Value::Decimal(d) => Ok(Value::Decimal(-d)),
         Value::Date(v) => Ok(Value::Date(-v)),
         other => Ok(Value::Double(-other.to_f64()?)),
     }
@@ -849,6 +1032,9 @@ pub fn compare_typed(
             } else {
                 ord
             })
+        }
+        (Value::Decimal(_), _) | (_, Value::Decimal(_)) => {
+            Ok(Some(a.to_decimal()?.cmp(&b.to_decimal()?)))
         }
         _ => Ok(a.to_f64()?.partial_cmp(&b.to_f64()?)),
     }

@@ -802,7 +802,11 @@ impl Interpreter {
                                     a.redim_preserve(bounds)?;
                                 }
                             } else {
-                                let arr = self.new_array(bounds, d.ty.as_ref())?;
+                                let mut arr = self.new_array(bounds, d.ty.as_ref())?;
+                                // Without `As`, the array keeps its declared element type.
+                                if let (None, Value::Array(old)) = (&d.ty, &s.borrow().value) {
+                                    arr = VbArray::new(arr.bounds, old.elem_type);
+                                }
                                 s.borrow_mut().value = Value::Array(Box::new(arr));
                             }
                         }

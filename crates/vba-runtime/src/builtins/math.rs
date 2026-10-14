@@ -1,5 +1,7 @@
 //! `VBA.Math` and `VBA.Financial`.
 
+use rust_decimal::{Decimal, RoundingStrategy};
+
 use super::*;
 
 /// Constants of this library (`name` is lowercase).
@@ -218,6 +220,7 @@ fn abs(v: &Value) -> VbaResult<Value> {
         Value::LongLong(i) => Value::LongLong(i.checked_abs().ok_or_else(VbaError::overflow)?),
         Value::Single(x) => Value::Single(x.abs()),
         Value::Currency(c) => Value::Currency(c.checked_abs().ok_or_else(VbaError::overflow)?),
+        Value::Decimal(d) => Value::Decimal(d.abs()),
         Value::Date(x) => Value::Date(x.abs()),
         other => Value::Double(other.to_f64()?.abs()),
     })
@@ -232,6 +235,11 @@ fn int_fix(v: &Value, f: fn(f64) -> f64) -> VbaResult<Value> {
         Value::Byte(_) | Value::Integer(_) | Value::Long(_) | Value::LongLong(_) => v.clone(),
         Value::Single(x) => Value::Single(f(*x as f64) as f32),
         Value::Currency(c) => Value::Currency(f(*c as f64 / 10_000.0) as i64 * 10_000),
+        Value::Decimal(d) => {
+            // `f` of the fraction alone is 0 or -1 (Int of a negative fraction).
+            let t = d.trunc();
+            Value::Decimal(t + Decimal::from(f(Value::Decimal(d - t).to_f64()?) as i64))
+        }
         Value::Date(x) => Value::Date(f(*x)),
         other => Value::Double(f(other.to_f64()?)),
     })
@@ -260,6 +268,9 @@ fn round(v: &Value, digits: i64) -> VbaResult<Value> {
             Value::Currency(q * unit)
         }
         Value::Currency(_) => v.clone(),
+        Value::Decimal(d) => Value::Decimal(
+            d.round_dp_with_strategy(digits.min(28) as u32, RoundingStrategy::MidpointNearestEven),
+        ),
         other => Value::Double(round_f(other.to_f64()?)),
     })
 }
