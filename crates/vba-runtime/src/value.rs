@@ -81,6 +81,8 @@ pub enum VarType {
     Currency,
     Date,
     String,
+    /// `String * N`: always exactly N characters.
+    FixedString(u32),
     Object,
 }
 
@@ -117,6 +119,7 @@ impl VarType {
             VarType::Currency => Value::Currency(0),
             VarType::Date => Value::Date(0.0),
             VarType::String => Value::String(String::new()),
+            VarType::FixedString(n) => Value::String("\0".repeat(n as usize)),
             VarType::Object => Value::Object(None),
         }
     }
@@ -141,6 +144,12 @@ impl VarType {
             VarType::Currency => Value::Currency((v.to_f64()? * 10_000.0).round_ties_even() as i64),
             VarType::Date => Value::Date(v.to_date()?),
             VarType::String => Value::String(v.to_string_value()?),
+            VarType::FixedString(n) => {
+                let mut s: String = v.to_string_value()?.chars().take(n as usize).collect();
+                let len = s.chars().count();
+                s.extend(std::iter::repeat_n(' ', n as usize - len));
+                Value::String(s)
+            }
             VarType::Object => match v {
                 Value::Object(_) => v,
                 _ => return Err(VbaError::type_mismatch()),
@@ -409,7 +418,7 @@ impl VarType {
             VarType::Double => "Double",
             VarType::Currency => "Currency",
             VarType::Date => "Date",
-            VarType::String => "String",
+            VarType::String | VarType::FixedString(_) => "String",
             VarType::Object => "Object",
         }
     }

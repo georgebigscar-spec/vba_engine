@@ -149,8 +149,27 @@ pub struct Token {
 
 const OPS: &[&str] = &[
     ":=", "<>", "<=", ">=", "+", "-", "*", "/", "\\", "^", "&", "=", "<", ">", "(", ")", ",", ".",
-    ":", "!", ";",
+    ":", "!", ";", "#",
 ];
+
+/// Whether the text after a `#` is a date literal (`#1/5/2024#`,
+/// `#12:30 PM#`) rather than a file number (`Close #1, #2`).
+fn looks_like_date(rest: &[char]) -> bool {
+    let Some(end) = rest.iter().position(|&c| c == '#' || c == '\n') else {
+        return false;
+    };
+    if rest[end] != '#' {
+        return false;
+    }
+    let body = &rest[..end];
+    body.iter().any(|c| c.is_ascii_digit())
+        && body
+            .iter()
+            .any(|&c| matches!(c, '/' | ':' | '-') || c.is_alphabetic())
+        && body
+            .iter()
+            .all(|&c| c.is_alphanumeric() || matches!(c, '/' | ':' | '-' | ' ' | ',' | '.'))
+}
 
 pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
     let chars: Vec<char> = src.chars().collect();
@@ -255,7 +274,8 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
             }
             '#' if out
                 .last()
-                .is_none_or(|t: &Token| !matches!(t.tok, Tok::Ident(_))) =>
+                .is_none_or(|t: &Token| !matches!(t.tok, Tok::Ident(_)))
+                && looks_like_date(&chars[i + 1..]) =>
             {
                 let start = i + 1;
                 let mut j = start;

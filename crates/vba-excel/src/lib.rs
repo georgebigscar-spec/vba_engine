@@ -200,6 +200,27 @@ impl Host for ExcelHost {
         }
         self.app.output.borrow_mut().push(text.to_string());
     }
+
+    // Macros run against a local workbook may read and write local files.
+    fn read_file(&mut self, path: &str) -> VbaResult<Vec<u8>> {
+        vba_runtime::host::fs::read_file(path)
+    }
+
+    fn write_file(&mut self, path: &str, data: &[u8]) -> VbaResult<()> {
+        vba_runtime::host::fs::write_file(path, data)
+    }
+
+    fn delete_file(&mut self, path: &str) -> VbaResult<()> {
+        vba_runtime::host::fs::delete_file(path)
+    }
+
+    fn create_dir(&mut self, path: &str) -> VbaResult<()> {
+        vba_runtime::host::fs::create_dir(path)
+    }
+
+    fn list_dir(&mut self, dir: &str) -> VbaResult<Vec<String>> {
+        vba_runtime::host::fs::list_dir(dir)
+    }
 }
 
 // ---- .xlsx I/O ----------------------------------------------------------------

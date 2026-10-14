@@ -16,6 +16,10 @@ use crate::host::Host;
 use crate::object::{same_object, Args, Collection, Invoke, ObjectRef};
 use crate::value::{self, UdtField, UdtValue, Value, VarType, VbArray};
 
+mod files;
+
+use files::OpenFile;
+
 const MAX_DEPTH: usize = 1000;
 
 /// Storage for one variable. Shared (`Rc`) so `ByRef` arguments alias the
@@ -28,6 +32,9 @@ pub struct Variable {
     /// `Dim x As New Class`: the object is created on first use, and again
     /// after `Set x = Nothing`.
     pub auto_new: Option<String>,
+    /// Declared with bounds (`Dim a(10)`): `Erase` clears it instead of
+    /// deallocating it.
+    pub fixed_array: bool,
 }
 
 pub type Slot = Rc<RefCell<Variable>>;
@@ -38,6 +45,7 @@ fn slot(value: Value, ty: VarType) -> Slot {
         ty,
         is_const: false,
         auto_new: None,
+        fixed_array: false,
     }))
 }
 
@@ -119,6 +127,10 @@ pub struct Interpreter {
     inspecting: bool,
     /// A `Debug.Print` line left open by a trailing `;` or `,`.
     print_pending: Option<String>,
+    /// Files opened with `Open ... As #n`.
+    files: HashMap<i64, OpenFile>,
+    /// The rest of the last `Dir(pattern)` search, for `Dir()`.
+    dir_pending: Option<Vec<String>>,
 }
 
 impl Interpreter {
@@ -138,6 +150,8 @@ impl Interpreter {
             steps: 0,
             inspecting: false,
             print_pending: None,
+            files: HashMap::new(),
+            dir_pending: None,
         }
     }
 
@@ -319,6 +333,9 @@ impl Interpreter {
         let slots = args.into_iter().map(ArgSource::Value).collect();
         let r = self.call_procedure(proc, module, None, slots, Vec::new());
         self.frames.clear();
+        // Unclosed files are flushed, as VBA does when a macro ends.
+        let closed = self.close_all_files();
+        let r = r.and_then(|v| closed.map(|_| v));
         let r = match r {
             // `End` and Reset discard objects without running Class_Terminate.
             Err(e) if !e.trappable => {
@@ -960,6 +977,24 @@ impl Interpreter {
             StmtKind::GoTo(l) => return Ok(Flow::GoTo(l.clone())),
             StmtKind::End => return Err(VbaError::end()),
             StmtKind::RaiseEvent { name, args } => self.raise_event(name, args)?,
+            StmtKind::Open { path, mode, file } => self.exec_open(path, *mode, file)?,
+            StmtKind::Close(files) => self.exec_close(files)?,
+            StmtKind::PrintFile { file, items } => self.exec_print_file(file, items)?,
+            StmtKind::WriteFile { file, items } => self.exec_write_file(file, items)?,
+            StmtKind::LineInput { file, target } => self.exec_line_input(file, target)?,
+            StmtKind::InputFile { file, targets } => self.exec_input_file(file, targets)?,
+            StmtKind::Erase(targets) => self.exec_erase(targets)?,
+            StmtKind::AlignSet {
+                right,
+                target,
+                value,
+            } => self.exec_align_set(*right, target, value)?,
+            StmtKind::MidAssign {
+                target,
+                start,
+                length,
+                value,
+            } => self.exec_mid_assign(target, start, length.as_ref(), value)?,
         }
         Ok(Flow::Normal)
     }
@@ -1061,18 +1096,42 @@ impl Interpreter {
     /// `;` joins, `,` moves to the next 14-column zone, and a trailing
     /// separator leaves the line open for the next `Debug.Print`.
     fn exec_print(&mut self, items: &[PrintItem]) -> VbaResult<()> {
-        let mut line = self.print_pending.take().unwrap_or_default();
+        let pending = self.print_pending.take().unwrap_or_default();
+        let (line, open) = match self.print_items(items, pending.clone(), 0) {
+            Ok(r) => r,
+            Err(err) => {
+                self.print_pending = Some(pending).filter(|l| !l.is_empty());
+                return Err(err);
+            }
+        };
+        if open {
+            self.print_pending = Some(line);
+        } else {
+            self.host.debug_print(&line);
+        }
+        Ok(())
+    }
+
+    /// Renders a `Print` list onto `line`, which starts at column
+    /// `start_col`; returns the line and whether a trailing `;`/`,` leaves
+    /// it open. `Tab(n)` moves to column `n`, `Spc(n)` adds spaces.
+    fn print_items(
+        &mut self,
+        items: &[PrintItem],
+        mut line: String,
+        start_col: usize,
+    ) -> VbaResult<(String, bool)> {
         let mut open = false;
         for item in items {
             match item {
                 PrintItem::Expr(e) => {
-                    let v = match self.eval(e) {
-                        Ok(v) => v,
-                        Err(err) => {
-                            self.print_pending = Some(line).filter(|l| !l.is_empty());
-                            return Err(err);
-                        }
-                    };
+                    let col = start_col + line.chars().count();
+                    if let Some(text) = self.print_positioning(e, col)? {
+                        line.push_str(&text);
+                        open = true;
+                        continue;
+                    }
+                    let v = self.eval(e)?;
                     let v = match v {
                         Value::Null => v,
                         v => self.scalar(v)?,
@@ -1082,18 +1141,38 @@ impl Interpreter {
                 }
                 PrintItem::Semicolon => open = true,
                 PrintItem::Comma => {
-                    let width = line.chars().count();
+                    let width = start_col + line.chars().count();
                     line.extend(std::iter::repeat_n(' ', (width / 14 + 1) * 14 - width));
                     open = true;
                 }
             }
         }
-        if open {
-            self.print_pending = Some(line);
-        } else {
-            self.host.debug_print(&line);
+        Ok((line, open))
+    }
+
+    /// `Tab(n)` / `Spc(n)` inside a `Print` list, as the spaces they add.
+    fn print_positioning(&mut self, e: &Expr, col: usize) -> VbaResult<Option<String>> {
+        let Expr::Index(callee, args) = e else {
+            return Ok(None);
+        };
+        let Expr::Ident(name) = &**callee else {
+            return Ok(None);
+        };
+        let is_tab = name.eq_ignore_ascii_case("tab");
+        if !(is_tab || name.eq_ignore_ascii_case("spc")) || self.lookup_proc(name).is_some() {
+            return Ok(None);
         }
-        Ok(())
+        let n = match args.first().and_then(|a| a.value.as_ref()) {
+            Some(a) => self.eval(a)?.to_i64()?.max(0) as usize,
+            None => 0,
+        };
+        Ok(Some(if is_tab {
+            // Columns are 1-based. Already past column n, VBA would wrap to
+            // the next line; here Tab then adds nothing.
+            " ".repeat(n.max(1).saturating_sub(col + 1))
+        } else {
+            " ".repeat(n)
+        }))
     }
 
     fn exec_call(&mut self, callee: &Expr, args: &[Arg]) -> VbaResult<Flow> {
@@ -1227,9 +1306,12 @@ impl Interpreter {
 
     fn new_var_slot(&mut self, v: &VarDecl) -> VbaResult<Slot> {
         if let Some(bounds) = &v.bounds {
+            let fixed = !bounds.is_empty();
             let bounds = self.eval_bounds(bounds)?;
             let arr = self.new_array(bounds, v.ty.as_ref())?;
-            return Ok(slot(Value::Array(Box::new(arr)), VarType::Variant));
+            let s = slot(Value::Array(Box::new(arr)), VarType::Variant);
+            s.borrow_mut().fixed_array = fixed;
+            return Ok(s);
         }
         if let Some(t) = v.ty.as_ref().filter(|t| t.is_new) {
             let s = slot(Value::Object(None), VarType::Object);
@@ -1262,11 +1344,27 @@ impl Interpreter {
         if let Some(def) = self.types.get(&t.name.to_ascii_lowercase()).cloned() {
             return Ok((VarType::Variant, self.new_udt(&def)?));
         }
-        let vt = self.var_type_of(Some(t));
+        let vt = self.declared_type(t)?;
         if t.is_new {
             return Ok((vt, self.new_object(&t.name)?));
         }
         Ok((vt, vt.default_value()))
+    }
+
+    /// Like [`var_type_of`](Self::var_type_of), also evaluating the length
+    /// of `String * N`.
+    fn declared_type(&mut self, t: &TypeName) -> VbaResult<VarType> {
+        match &t.fixed_len {
+            Some(len) => {
+                let n = self.eval(len)?.to_i64()?;
+                let n = u32::try_from(n)
+                    .ok()
+                    .filter(|&n| n >= 1)
+                    .ok_or_else(VbaError::invalid_call)?;
+                Ok(VarType::FixedString(n))
+            }
+            None => Ok(self.var_type_of(Some(t))),
+        }
     }
 
     fn new_udt(&mut self, def: &TypeDef) -> VbaResult<Value> {
@@ -1287,7 +1385,10 @@ impl Interpreter {
     }
 
     fn new_array(&mut self, bounds: Vec<(i64, i64)>, ty: Option<&TypeName>) -> VbaResult<VbArray> {
-        let elem = self.var_type_of(ty);
+        let elem = match ty {
+            Some(t) => self.declared_type(t)?,
+            None => VarType::Variant,
+        };
         let mut arr = VbArray::new(bounds, elem);
         if let Some(def) = ty.and_then(|t| self.types.get(&t.name.to_ascii_lowercase()).cloned()) {
             let init = self.new_udt(&def)?;
@@ -2007,6 +2108,9 @@ impl Interpreter {
                     return self.index_value(Value::from(self.err.clone()), args, kind);
                 }
                 let mut evaluated = self.eval_args(args)?;
+                if let Some(r) = self.file_builtin(name, &evaluated) {
+                    return r;
+                }
                 if !builtins::takes_objects(name) {
                     // `CStr(obj)`, `Len(obj)`: a class's default member.
                     for v in evaluated.positional.iter_mut() {
