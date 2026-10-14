@@ -1,0 +1,19 @@
+[package]
+name = "vba-excel"
+description = "In-memory Excel object model (Application, Workbook, Worksheet, Range) for the VBA engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["xlsx"]
+# Load and save .xlsx files.
+xlsx = ["dep:calamine", "dep:rust_xlsxwriter"]
+
+[dependencies]
+vba-runtime.workspace = true
+calamine = { version = "0.36", optional = true }
+rust_xlsxwriter = { version = "0.99", optional = true }
+
+[dev-dependencies]
+vba-syntax.workspace = true

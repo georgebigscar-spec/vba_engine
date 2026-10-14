@@ -25,7 +25,8 @@ engine.run("Main", vec![])?;
 | `vba-syntax` | lexer, parser, AST |
 | `vba-runtime` | Variant type system, host object model (`Host`, `Object`), standard library, interpreter, debug hooks |
 | `vba-debug` | breakpoints (conditional, hit counts, logpoints), step into/over/out, run to line, watches (break when true / changed), break on errors, cross-thread frontend |
-| `vba-cli` | `vba run file.bas`, `vba debug file.bas` |
+| `vba-excel` | in-memory Excel object model as a `Host`: `Application`, `Workbooks`, `Worksheets`, `Range` (`Cells`, `End`, `Offset`, `Resize`, `CurrentRegion`, array `Value`, `Font`, `Interior`, `NumberFormat`), `WorksheetFunction`, `xl*` constants; `.xlsx` load/save |
+| `vba-cli` | `vba run file.bas`, `vba debug file.bas`, `--excel`, `--workbook in.xlsx`, `--save out.xlsx` |
 
 ## Try it
 
@@ -33,7 +34,22 @@ engine.run("Main", vec![])?;
 cargo run -p vba-cli -- run examples/Invoice.bas
 cargo run -p vba-cli -- run examples/Bank.bas examples/Account.cls   # classes, Type, Enum
 cargo run -p vba-cli -- debug examples/Invoice.bas   # then: help
+cargo run -p vba-cli -- run examples/SalesReport.bas --excel --save report.xlsx
+cargo run -p vba-cli -- run MyMacro.bas --workbook data.xlsx --save out.xlsx
 cargo test
+```
+
+Running Excel macros from Rust:
+
+```rust
+use vba_excel::ExcelHost;
+use vba_runtime::Engine;
+
+let host = ExcelHost::open("data.xlsx")?;
+let mut engine = Engine::new(host.clone());
+engine.load_source(macro_source, "Module1")?;
+engine.run("Main", vec![])?;
+host.save_as("out.xlsx")?;
 ```
 
 Exposing an application to VBA code means implementing `Host` (globals such

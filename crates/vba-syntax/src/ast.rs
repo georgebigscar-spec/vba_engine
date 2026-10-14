@@ -113,6 +113,16 @@ pub struct VarDecl {
     pub bounds: Option<Vec<(Option<Expr>, Expr)>>,
 }
 
+/// An item of a `Debug.Print` list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PrintItem {
+    Expr(Expr),
+    /// `;`: no space between items.
+    Semicolon,
+    /// `,`: move to the next 14-column print zone.
+    Comma,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stmt {
     pub kind: StmtKind,
@@ -137,6 +147,9 @@ pub enum StmtKind {
         target: Expr,
         value: Expr,
     },
+    /// `Debug.Print a; b, c;` — kept apart from calls because `;` and `,`
+    /// mean different things here.
+    DebugPrint(Vec<PrintItem>),
     /// `Foo a, b`, `Call Foo(a, b)`, `obj.Method a`
     Call {
         callee: Expr,

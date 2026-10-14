@@ -76,7 +76,7 @@ fn step_over_stays_in_main() {
     let (p, out) = session(|_| {}, true, |_, _| Command::StepOver);
     assert_eq!(lines(&p), vec![7, 8, 8, 8, 10, 11]);
     assert!(p.iter().all(|(_, _, proc)| proc == "Main"));
-    assert_eq!(out, vec!["14"]);
+    assert_eq!(out, vec![" 14 "]);
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn logpoint_prints_without_pausing() {
         |_, _| Command::Continue,
     );
     assert!(p.is_empty());
-    assert_eq!(out, vec!["i=1", "i=2", "i=3", "14"]);
+    assert_eq!(out, vec!["i=1", "i=2", "i=3", " 14 "]);
 }
 
 #[test]
@@ -178,7 +178,7 @@ fn immediate_window_changes_state() {
             Command::Continue
         },
     );
-    assert_eq!(out, vec!["1000"]);
+    assert_eq!(out, vec![" 1000 "]);
 }
 
 #[test]
@@ -226,7 +226,7 @@ fn channel_frontend_across_threads() {
         .unwrap();
     assert_eq!(rx.recv().unwrap().unwrap(), "28");
     requests.send(Request::Resume(Command::Continue)).unwrap();
-    assert_eq!(worker.join().unwrap(), vec!["14"]);
+    assert_eq!(worker.join().unwrap(), vec![" 14 "]);
 }
 
 #[test]

@@ -4,6 +4,10 @@
 //! vba run   Module1.bas [Class1.cls ...] [--entry Main]
 //! vba debug Module1.bas [Class1.cls ...] [--entry Main] [--break-on never|unhandled|all]
 //! ```
+//!
+//! Excel macros run against an in-memory workbook: `--excel` starts with an
+//! empty `Book1`, `--workbook in.xlsx` opens a file, `--save out.xlsx` writes
+//! the active workbook after the macro finishes.
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
@@ -11,6 +15,7 @@ use std::process::ExitCode;
 use vba_debug::{
     Command, Debugger, ErrorBreak, Frontend, PauseEvent, PauseReason, Session, WatchKind,
 };
+use vba_excel::ExcelHost;
 use vba_runtime::{Engine, StdHost};
 
 const HELP: &str = "\
@@ -225,11 +230,15 @@ struct Options {
     files: Vec<String>,
     entry: String,
     error_break: ErrorBreak,
+    excel: bool,
+    workbook: Option<String>,
+    save: Option<String>,
 }
 
 fn parse_args() -> Result<Options, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: vba <run|debug> <file.bas|file.cls>... [--entry Main] [--break-on never|unhandled|all]";
+    let usage = "usage: vba <run|debug> <file.bas|file.cls>... [--entry Main] [--break-on never|unhandled|all]\n\
+                 \x20      [--excel] [--workbook in.xlsx] [--save out.xlsx]";
     let debug = match args.first().map(String::as_str) {
         Some("run") => false,
         Some("debug") => true,
@@ -240,6 +249,9 @@ fn parse_args() -> Result<Options, String> {
         files: Vec::new(),
         entry: "Main".into(),
         error_break: ErrorBreak::Unhandled,
+        excel: false,
+        workbook: None,
+        save: None,
     };
     let mut i = 1;
     while i < args.len() && !args[i].starts_with("--") {
@@ -250,8 +262,15 @@ fn parse_args() -> Result<Options, String> {
         return Err(usage.into());
     }
     while i < args.len() {
+        if args[i] == "--excel" {
+            opts.excel = true;
+            i += 1;
+            continue;
+        }
         let val = args.get(i + 1).cloned().ok_or(usage)?;
         match args[i].as_str() {
+            "--workbook" => opts.workbook = Some(val),
+            "--save" => opts.save = Some(val),
             "--entry" => opts.entry = val,
             "--break-on" => {
                 opts.error_break = match val.as_str() {
@@ -268,7 +287,16 @@ fn parse_args() -> Result<Options, String> {
 }
 
 fn run(opts: Options) -> Result<(), String> {
-    let mut engine = Engine::new(StdHost);
+    let excel = match &opts.workbook {
+        Some(path) => Some(ExcelHost::open(path).map_err(|e| e.to_string())?),
+        None if opts.excel || opts.save.is_some() => Some(ExcelHost::new()),
+        None => None,
+    }
+    .map(|h| h.with_echo(true));
+    let mut engine = match &excel {
+        Some(host) => Engine::new(host.clone()),
+        None => Engine::new(StdHost),
+    };
     let mut sources = Vec::new();
     for file in &opts.files {
         let source = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
@@ -304,10 +332,12 @@ fn run(opts: Options) -> Result<(), String> {
         dbg.state.error_break = opts.error_break;
         engine.set_debug_hook(dbg);
     }
-    engine
-        .run(&opts.entry, vec![])
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    engine.run(&opts.entry, vec![]).map_err(|e| e.to_string())?;
+    if let (Some(host), Some(path)) = (&excel, &opts.save) {
+        host.save_as(path).map_err(|e| e.to_string())?;
+        eprintln!("saved {path}");
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
