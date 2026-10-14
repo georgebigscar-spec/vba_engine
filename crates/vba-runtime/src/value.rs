@@ -392,8 +392,8 @@ impl Value {
 
     fn numeric_rank(&self) -> u8 {
         match self {
-            Value::Empty | Value::Byte(_) => 0,
-            Value::Boolean(_) | Value::Integer(_) => 1,
+            Value::Byte(_) => 0,
+            Value::Empty | Value::Boolean(_) | Value::Integer(_) => 1,
             Value::Long(_) => 2,
             Value::LongLong(_) => 3,
             Value::Single(_) => 4,
@@ -533,28 +533,66 @@ impl<T: crate::object::Object + 'static> From<Rc<T>> for Value {
 }
 
 // ---- operators ---------------------------------------------------------
+//
+// `strict` is true when both operands have a fixed static type (typed
+// variables, literals, typed function results): VBA then raises Overflow when
+// the result does not fit that type, where Variant arithmetic widens instead.
 
-/// Builds an integral result of the given rank, widening on overflow the way
-/// Variant arithmetic does (Integer → Long → LongLong → Double).
-fn int_result(v: i128, rank: u8) -> Value {
-    if rank <= 1 && (i16::MIN as i128..=i16::MAX as i128).contains(&v) {
-        if rank == 0 && (0..=255).contains(&v) {
-            return Value::Byte(v as u8);
+/// Builds an integral result of the given rank (0 Byte, 1 Integer, 2 Long,
+/// 3 LongLong). A value that does not fit is Overflow when `strict`, otherwise
+/// it widens the way Variant arithmetic does (Byte → Integer → Long → Double).
+fn int_result(v: i128, rank: u8, strict: bool) -> VbaResult<Value> {
+    let mut rank = rank;
+    loop {
+        let fits = match rank {
+            0 => (0..=255).contains(&v),
+            1 => (i16::MIN as i128..=i16::MAX as i128).contains(&v),
+            2 => (i32::MIN as i128..=i32::MAX as i128).contains(&v),
+            _ => (i64::MIN as i128..=i64::MAX as i128).contains(&v),
+        };
+        if fits {
+            return Ok(match rank {
+                0 => Value::Byte(v as u8),
+                1 => Value::Integer(v as i16),
+                2 => Value::Long(v as i32),
+                _ => Value::LongLong(v as i64),
+            });
         }
-        return Value::Integer(v as i16);
+        if strict {
+            return Err(VbaError::overflow());
+        }
+        if rank >= 2 {
+            return Ok(Value::Double(v as f64));
+        }
+        rank += 1;
     }
-    if rank <= 2 && (i32::MIN as i128..=i32::MAX as i128).contains(&v) {
-        return Value::Long(v as i32);
+}
+
+/// Builds a floating result of the given rank (4 Single, 5 Double,
+/// 6 Currency, 7 Date); a Variant Single that overflows becomes a Double.
+fn float_result(v: f64, rank: u8, strict: bool) -> VbaResult<Value> {
+    if !v.is_finite() {
+        return Err(VbaError::overflow());
     }
-    if (i64::MIN as i128..=i64::MAX as i128).contains(&v) {
-        return Value::LongLong(v as i64);
-    }
-    Value::Double(v as f64)
+    Ok(match rank {
+        4 if (v as f32).is_finite() => Value::Single(v as f32),
+        4 if strict => return Err(VbaError::overflow()),
+        6 => {
+            let c = (v * 10_000.0).round_ties_even();
+            if c.abs() >= i64::MAX as f64 {
+                return Err(VbaError::overflow());
+            }
+            Value::Currency(c as i64)
+        }
+        7 => Value::Date(v),
+        _ => Value::Double(v),
+    })
 }
 
 fn arith(
     a: &Value,
     b: &Value,
+    strict: bool,
     int_op: fn(i128, i128) -> i128,
     float_op: fn(f64, f64) -> f64,
 ) -> VbaResult<Value> {
@@ -562,80 +600,125 @@ fn arith(
         return Ok(Value::Null);
     }
     let (a, b) = (a.clone().into_scalar()?, b.clone().into_scalar()?);
-    let rank = a.numeric_rank().max(b.numeric_rank());
+    let (ra, rb) = (a.numeric_rank(), b.numeric_rank());
+    // Long or LongLong with Single gives Double.
+    let rank = match (ra.max(rb), ra.min(rb)) {
+        (4, 2..=3) => 5,
+        (r, _) => r,
+    };
     match rank {
-        0..=3 => Ok(int_result(
+        0..=3 => int_result(
             int_op(a.to_i64()? as i128, b.to_i64()? as i128),
             rank,
-        )),
-        4 => Ok(Value::Single(float_op(a.to_f64()?, b.to_f64()?) as f32)),
-        6 => Ok(Value::Currency(
-            (float_op(a.to_f64()?, b.to_f64()?) * 10_000.0).round_ties_even() as i64,
-        )),
-        7 => Ok(Value::Date(float_op(a.to_f64()?, b.to_f64()?))),
-        _ => Ok(Value::Double(float_op(a.to_f64()?, b.to_f64()?))),
+            strict,
+        ),
+        _ => float_result(float_op(a.to_f64()?, b.to_f64()?), rank, strict),
     }
 }
 
-pub fn add(a: &Value, b: &Value) -> VbaResult<Value> {
-    if let (Value::String(x), Value::String(y)) = (a, b) {
-        return Ok(Value::String(format!("{x}{y}")));
+/// `+`: two strings (or a string and Empty) concatenate, anything else adds.
+pub fn add(a: &Value, b: &Value, strict: bool) -> VbaResult<Value> {
+    match (a, b) {
+        (Value::String(x), Value::String(y)) => Ok(Value::String(format!("{x}{y}"))),
+        (Value::Empty, Value::String(s)) | (Value::String(s), Value::Empty) => {
+            Ok(Value::String(s.clone()))
+        }
+        _ => arith(a, b, strict, |x, y| x + y, |x, y| x + y),
     }
-    arith(a, b, |x, y| x + y, |x, y| x + y)
 }
 
-pub fn sub(a: &Value, b: &Value) -> VbaResult<Value> {
-    arith(a, b, |x, y| x - y, |x, y| x - y)
+/// `-`; the difference of two dates is a Double.
+pub fn sub(a: &Value, b: &Value, strict: bool) -> VbaResult<Value> {
+    if let (Value::Date(x), Value::Date(y)) = (a, b) {
+        return Ok(Value::Double(x - y));
+    }
+    arith(a, b, strict, |x, y| x - y, |x, y| x - y)
 }
 
-pub fn mul(a: &Value, b: &Value) -> VbaResult<Value> {
-    arith(a, b, |x, y| x * y, |x, y| x * y)
+pub fn mul(a: &Value, b: &Value, strict: bool) -> VbaResult<Value> {
+    arith(a, b, strict, |x, y| x * y, |x, y| x * y)
 }
 
-pub fn div(a: &Value, b: &Value) -> VbaResult<Value> {
+/// `/`: a Double, or a Single when a Single meets nothing wider than Integer.
+/// `0 / 0` is Overflow, any other division by zero is error 11.
+pub fn div(a: &Value, b: &Value, strict: bool) -> VbaResult<Value> {
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
         return Ok(Value::Null);
     }
-    let d = b.to_f64()?;
-    if d == 0.0 {
-        return Err(VbaError::division_by_zero());
+    let (x, y) = (a.to_f64()?, b.to_f64()?);
+    if y == 0.0 {
+        return Err(if x == 0.0 {
+            VbaError::overflow()
+        } else {
+            VbaError::division_by_zero()
+        });
     }
-    Ok(Value::Double(a.to_f64()? / d))
+    let (ra, rb) = (a.numeric_rank(), b.numeric_rank());
+    let single = ra.max(rb) == 4 && ![ra, rb].iter().any(|r| (2..=3).contains(r));
+    float_result(x / y, if single { 4 } else { 5 }, strict)
 }
 
-pub fn int_div(a: &Value, b: &Value) -> VbaResult<Value> {
+/// The rank of an operand of `\`, `Mod` and the logical operators: Byte and
+/// Integer-like types keep their size, LongLong stays LongLong and anything
+/// else (floating types, strings, dates) is rounded to a Long.
+fn int_rank(v: &Value) -> u8 {
+    match v {
+        Value::Byte(_) => 0,
+        Value::Integer(_) | Value::Boolean(_) | Value::Empty => 1,
+        Value::LongLong(_) => 3,
+        _ => 2,
+    }
+}
+
+/// An operand of `\`, `Mod` or a logical operator as an integer: rounded
+/// with banker's rounding, Overflow when it does not fit a Long.
+fn int_operand(v: &Value) -> VbaResult<i64> {
+    let n = match v {
+        Value::Boolean(b) => -(*b as i64),
+        other => other.to_i64()?,
+    };
+    if int_rank(v) < 3 && i32::try_from(n).is_err() {
+        return Err(VbaError::overflow());
+    }
+    Ok(n)
+}
+
+fn int_div_op(a: &Value, b: &Value, strict: bool, op: fn(i128, i128) -> i128) -> VbaResult<Value> {
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
         return Ok(Value::Null);
     }
-    let (x, y) = (a.to_i64()?, b.to_i64()?);
+    let (x, y) = (int_operand(a)?, int_operand(b)?);
     if y == 0 {
         return Err(VbaError::division_by_zero());
     }
-    Ok(int_result(
-        (x / y) as i128,
-        a.numeric_rank().max(b.numeric_rank()).clamp(1, 3),
-    ))
+    int_result(
+        op(x as i128, y as i128),
+        int_rank(a).max(int_rank(b)),
+        strict,
+    )
 }
 
-pub fn modulo(a: &Value, b: &Value) -> VbaResult<Value> {
-    if matches!(a, Value::Null) || matches!(b, Value::Null) {
-        return Ok(Value::Null);
-    }
-    let (x, y) = (a.to_i64()?, b.to_i64()?);
-    if y == 0 {
-        return Err(VbaError::division_by_zero());
-    }
-    Ok(int_result(
-        (x % y) as i128,
-        a.numeric_rank().max(b.numeric_rank()).clamp(1, 3),
-    ))
+/// `\`: integer division of the operands rounded to integers; truncates.
+pub fn int_div(a: &Value, b: &Value, strict: bool) -> VbaResult<Value> {
+    int_div_op(a, b, strict, |x, y| x / y)
 }
 
+/// `Mod`: remainder with the sign of the dividend.
+pub fn modulo(a: &Value, b: &Value, strict: bool) -> VbaResult<Value> {
+    int_div_op(a, b, strict, |x, y| x % y)
+}
+
+/// `^`: always a Double; a negative base needs an integral exponent.
 pub fn pow(a: &Value, b: &Value) -> VbaResult<Value> {
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
         return Ok(Value::Null);
     }
-    Ok(Value::Double(a.to_f64()?.powf(b.to_f64()?)))
+    let (x, y) = (a.to_f64()?, b.to_f64()?);
+    let r = x.powf(y);
+    if (x < 0.0 && y.fract() != 0.0) || r.is_nan() {
+        return Err(VbaError::invalid_call());
+    }
+    float_result(r, 5, true)
 }
 
 pub fn concat(a: &Value, b: &Value) -> VbaResult<Value> {
@@ -651,42 +734,56 @@ pub fn concat(a: &Value, b: &Value) -> VbaResult<Value> {
     Ok(Value::String(part(a)? + &part(b)?))
 }
 
-pub fn neg(a: &Value) -> VbaResult<Value> {
+/// Unary minus; `-Byte`, `-Boolean` and `-Empty` are Integers.
+pub fn neg(a: &Value, strict: bool) -> VbaResult<Value> {
     match a {
         Value::Null => Ok(Value::Null),
         Value::Empty => Ok(Value::Integer(0)),
+        Value::Boolean(b) => Ok(Value::Integer(*b as i16)),
         Value::Byte(v) => Ok(Value::Integer(-(*v as i16))),
-        Value::Integer(v) => Ok(int_result(-(*v as i128), 1)),
-        Value::Long(v) => Ok(int_result(-(*v as i128), 2)),
-        Value::LongLong(v) => Ok(int_result(-(*v as i128), 3)),
+        Value::Integer(v) => int_result(-(*v as i128), 1, strict),
+        Value::Long(v) => int_result(-(*v as i128), 2, strict),
+        Value::LongLong(v) => int_result(-(*v as i128), 3, strict),
         Value::Single(v) => Ok(Value::Single(-v)),
-        Value::Currency(v) => Ok(Value::Currency(-v)),
+        Value::Currency(v) => Ok(Value::Currency(
+            v.checked_neg().ok_or_else(VbaError::overflow)?,
+        )),
         Value::Date(v) => Ok(Value::Date(-v)),
-        Value::Boolean(b) => Ok(Value::Integer(if *b { 1 } else { 0 })),
         other => Ok(Value::Double(-other.to_f64()?)),
     }
 }
 
-/// `Not` / `And` / `Or` / ... are bitwise on integers; on Booleans they stay Boolean.
-pub fn logical(op: fn(i64, i64) -> i64, a: &Value, b: &Value) -> VbaResult<Value> {
-    if matches!(a, Value::Null) || matches!(b, Value::Null) {
-        return Ok(Value::Null);
+/// The result of a logical operator: Boolean when both operands are, else
+/// an integer of the wider operand's rank.
+fn logic_result(v: i64, a: &Value, b: &Value) -> VbaResult<Value> {
+    if matches!((a, b), (Value::Boolean(_), Value::Boolean(_))) {
+        return Ok(Value::Boolean(v != 0));
     }
-    if let (Value::Boolean(x), Value::Boolean(y)) = (a, b) {
-        let r = op(if *x { -1 } else { 0 }, if *y { -1 } else { 0 });
-        return Ok(Value::Boolean(r != 0));
-    }
-    let (x, y) = (bool_or_int(a)?, bool_or_int(b)?);
-    Ok(int_result(
-        op(x, y) as i128,
-        a.numeric_rank().max(b.numeric_rank()).clamp(1, 3),
-    ))
+    let rank = int_rank(a).max(int_rank(b));
+    int_result(if rank == 0 { v & 0xFF } else { v } as i128, rank, false)
 }
 
-fn bool_or_int(v: &Value) -> VbaResult<i64> {
-    match v {
-        Value::Boolean(b) => Ok(if *b { -1 } else { 0 }),
-        other => other.to_i64(),
+/// `And` / `Or` / `Xor` / `Eqv` / `Imp` are bitwise on integers; on Booleans
+/// they stay Boolean. With one Null operand the result is known only when it
+/// is the same whatever Null stands for (`False And Null` is False,
+/// `True Or Null` is True, `False Imp Null` is True); otherwise it is Null.
+pub fn logical(op: fn(i64, i64) -> i64, a: &Value, b: &Value) -> VbaResult<Value> {
+    match (a, b) {
+        (Value::Null, Value::Null) => Ok(Value::Null),
+        (Value::Null, x) | (x, Value::Null) => {
+            let n = int_operand(x)?;
+            let (lo, hi) = if matches!(a, Value::Null) {
+                (op(0, n), op(-1, n))
+            } else {
+                (op(n, 0), op(n, -1))
+            };
+            if lo == hi {
+                logic_result(lo, x, x)
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        _ => logic_result(op(int_operand(a)?, int_operand(b)?), a, b),
     }
 }
 
@@ -694,44 +791,79 @@ pub fn not(a: &Value) -> VbaResult<Value> {
     match a {
         Value::Null => Ok(Value::Null),
         Value::Boolean(b) => Ok(Value::Boolean(!b)),
-        other => Ok(int_result(
-            !other.to_i64()? as i128,
-            other.numeric_rank().clamp(1, 3),
-        )),
+        Value::Byte(v) => Ok(Value::Byte(!v)),
+        other => int_result(!int_operand(other)? as i128, int_rank(other), false),
     }
 }
 
-/// Compares two values. Returns `None` if either side is Null.
+fn compare_strings(x: &str, y: &str, text: bool) -> Ordering {
+    if text {
+        x.to_lowercase().cmp(&y.to_lowercase())
+    } else {
+        x.cmp(y)
+    }
+}
+
+/// Compares two values as when both have a fixed static type. Returns
+/// `None` if either side is Null.
 pub fn compare(a: &Value, b: &Value, text: bool) -> VbaResult<Option<Ordering>> {
+    compare_typed(a, b, text, (true, true))
+}
+
+/// Compares two values; `fixed` says which operands have a fixed
+/// (non-Variant) static type, which decides how a string meets a number:
+/// against a fixed number the string is converted (Type mismatch if it is not
+/// numeric); a fixed String against a Variant number compares as text; two
+/// Variants never convert, the number is less than the string. Empty against
+/// a string is `""`. Returns `None` if either side is Null.
+pub fn compare_typed(
+    a: &Value,
+    b: &Value,
+    text: bool,
+    fixed: (bool, bool),
+) -> VbaResult<Option<Ordering>> {
     let (a, b) = (a.clone().into_scalar()?, b.clone().into_scalar()?);
     match (&a, &b) {
         (Value::Null, _) | (_, Value::Null) => Ok(None),
-        (Value::String(x), Value::String(y)) => Ok(Some(if text {
-            x.to_lowercase().cmp(&y.to_lowercase())
-        } else {
-            x.cmp(y)
-        })),
+        (Value::String(x), Value::String(y)) => Ok(Some(compare_strings(x, y, text))),
         (Value::String(s), n) | (n, Value::String(s)) if n.is_numeric_type() => {
-            let swapped = matches!(a, Value::String(_));
-            match parse_number(s) {
-                Some(sv) => {
-                    let nv = n.to_f64()?;
-                    let ord = if swapped {
-                        sv.partial_cmp(&nv)
-                    } else {
-                        nv.partial_cmp(&sv)
-                    };
-                    Ok(ord)
-                }
-                None if matches!(n, Value::Empty) => {
-                    let ord = String::new().cmp(s);
-                    Ok(Some(if swapped { ord.reverse() } else { ord }))
-                }
-                None => Err(VbaError::type_mismatch()),
-            }
+            let string_left = matches!(a, Value::String(_));
+            let (s_fixed, n_fixed) = if string_left {
+                fixed
+            } else {
+                (fixed.1, fixed.0)
+            };
+            // The order of `n` relative to `s`.
+            let ord = if matches!(n, Value::Empty) {
+                Some(compare_strings("", s, text))
+            } else if n_fixed {
+                let sv = parse_number(s).ok_or_else(VbaError::type_mismatch)?;
+                n.to_f64()?.partial_cmp(&sv)
+            } else if s_fixed {
+                Some(compare_strings(&n.to_string_value()?, s, text))
+            } else {
+                Some(Ordering::Less)
+            };
+            Ok(if string_left {
+                ord.map(Ordering::reverse)
+            } else {
+                ord
+            })
         }
         _ => Ok(a.to_f64()?.partial_cmp(&b.to_f64()?)),
     }
+}
+
+/// The `Like` operator: as [`like`], but a `[` without its `]` is error 93.
+pub fn like_op(s: &str, pattern: &str, text: bool) -> VbaResult<bool> {
+    let mut rest = pattern;
+    while let Some(i) = rest.find('[') {
+        match rest[i..].find(']') {
+            Some(j) => rest = &rest[i + j + 1..],
+            None => return Err(VbaError::new(93, "Invalid pattern string")),
+        }
+    }
+    Ok(like(s, pattern, text))
 }
 
 /// `Like` operator: `*`, `?`, `#`, `[a-z]`, `[!a-z]`.
@@ -785,13 +917,14 @@ mod tests {
 
     #[test]
     fn integer_arithmetic_widens() {
-        let r = add(&Value::Integer(32767), &Value::Integer(1)).unwrap();
+        let r = add(&Value::Integer(32767), &Value::Integer(1), false).unwrap();
+        assert!(add(&Value::Integer(32767), &Value::Integer(1), true).is_err());
         assert!(matches!(r, Value::Long(32768)));
         assert!(
-            matches!(add(&Value::str("1"), &Value::Integer(2)).unwrap(), Value::Double(v) if v == 3.0)
+            matches!(add(&Value::str("1"), &Value::Integer(2), false).unwrap(), Value::Double(v) if v == 3.0)
         );
         assert!(
-            matches!(add(&Value::str("1"), &Value::str("2")).unwrap(), Value::String(s) if s == "12")
+            matches!(add(&Value::str("1"), &Value::str("2"), false).unwrap(), Value::String(s) if s == "12")
         );
     }
 

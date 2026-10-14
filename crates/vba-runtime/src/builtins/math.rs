@@ -22,7 +22,7 @@ pub(super) fn call(
             v if value::compare(v, &Value::Integer(0), false)?
                 == Some(std::cmp::Ordering::Less) =>
             {
-                value::neg(v)?
+                value::neg(v, false)?
             }
             v => v.clone(),
         },
