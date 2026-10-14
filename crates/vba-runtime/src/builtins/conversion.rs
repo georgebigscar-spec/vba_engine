@@ -26,7 +26,7 @@ pub(super) fn call(
         "csng" => VarType::Single.coerce(arg(args, 0)?.clone())?,
         "cdbl" => VarType::Double.coerce(arg(args, 0)?.clone())?,
         "ccur" => VarType::Currency.coerce(arg(args, 0)?.clone())?,
-        "cdate" | "datevalue" => VarType::Date.coerce(arg(args, 0)?.clone())?,
+        "cdate" => VarType::Date.coerce(arg(args, 0)?.clone())?,
         "cvar" => arg(args, 0)?.clone(),
         "cverr" => Value::Error(int(args, 0)? as i32),
         "val" => Value::Double(val(&s(args, 0)?)),

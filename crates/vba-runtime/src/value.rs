@@ -585,6 +585,10 @@ pub fn add(a: &Value, b: &Value) -> VbaResult<Value> {
 }
 
 pub fn sub(a: &Value, b: &Value) -> VbaResult<Value> {
+    // Date - Date is the Double number of days between them.
+    if let (Value::Date(x), Value::Date(y)) = (a, b) {
+        return Ok(Value::Double(x - y));
+    }
     arith(a, b, |x, y| x - y, |x, y| x - y)
 }
 
