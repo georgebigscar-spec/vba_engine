@@ -97,6 +97,23 @@ thread_local! {
 }
 
 /// Calls a built-in function. Returns `None` if `name` is not a built-in.
+/// Built-ins that look at an object itself rather than its default value.
+pub fn takes_objects(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "typename"
+            | "isobject"
+            | "vartype"
+            | "isnull"
+            | "isempty"
+            | "isarray"
+            | "ismissing"
+            | "objptr"
+            | "callbyname"
+            | "iserror"
+    )
+}
+
 pub fn call(
     name: &str,
     args: &Args,

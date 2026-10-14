@@ -199,6 +199,24 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
                 line += 1;
                 col = 1;
             }
+            '[' => {
+                // `[_NewEnum]`: a bracketed identifier may hold any name.
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j] != ']' && chars[j] != '\n' {
+                    j += 1;
+                }
+                if chars.get(j) != Some(&']') {
+                    return Err(SyntaxError::new(
+                        "unterminated [identifier]",
+                        Span { line: sl, col: sc },
+                    ));
+                }
+                let word: String = chars[start..j].iter().collect();
+                col += (j + 1 - i) as u32;
+                i = j + 1;
+                push!(Tok::Ident(word), sl, sc);
+            }
             '\'' => {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;

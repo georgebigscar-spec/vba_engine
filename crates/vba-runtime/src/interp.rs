@@ -8,7 +8,7 @@ use std::rc::Rc;
 use vba_syntax::ast::*;
 
 use crate::builtins;
-use crate::class::{ClassDef, ClassInstance, ProcSet};
+use crate::class::{ClassDef, ClassInstance, ProcSet, TerminateQueue};
 use crate::debug::{DebugAction, DebugContext, DebugHook, Location, StopKind};
 use crate::errobj::ErrObject;
 use crate::error::{VbaError, VbaResult};
@@ -25,6 +25,9 @@ pub struct Variable {
     pub value: Value,
     pub ty: VarType,
     pub is_const: bool,
+    /// `Dim x As New Class`: the object is created on first use, and again
+    /// after `Set x = Nothing`.
+    pub auto_new: Option<String>,
 }
 
 pub type Slot = Rc<RefCell<Variable>>;
@@ -34,6 +37,7 @@ fn slot(value: Value, ty: VarType) -> Slot {
         value,
         ty,
         is_const: false,
+        auto_new: None,
     }))
 }
 
@@ -71,6 +75,22 @@ pub(crate) struct ModuleInfo {
     text_compare: bool,
 }
 
+/// A module-level variable or constant.
+struct Global {
+    name: String,
+    slot: Slot,
+    /// The declaring standard module; `None` for enum members and variables
+    /// created outside any procedure (the Immediate window).
+    module: Option<Rc<ModuleInfo>>,
+    public: bool,
+}
+
+/// The procedures one standard module defines under a name.
+struct StdProc {
+    set: ProcSet,
+    module: Rc<ModuleInfo>,
+}
+
 enum Flow {
     Normal,
     Exit(ExitKind),
@@ -79,11 +99,16 @@ enum Flow {
 }
 
 pub struct Interpreter {
-    procs: HashMap<String, (Rc<Procedure>, Rc<ModuleInfo>)>,
+    /// Standard-module procedures by lower-case name; one entry per module.
+    procs: HashMap<String, Vec<StdProc>>,
+    /// Standard modules by lower-case name, for `Module1.Foo`.
+    modules: HashMap<String, Rc<ModuleInfo>>,
     classes: HashMap<String, Rc<ClassDef>>,
     types: HashMap<String, Rc<TypeDef>>,
     enums: HashMap<String, Vec<(String, Value)>>,
-    globals: Vec<(String, Slot)>,
+    globals: Vec<Global>,
+    /// Instances waiting for their `Class_Terminate`.
+    terminate: TerminateQueue,
     frames: Vec<Frame>,
     host: Box<dyn Host>,
     hook: Option<Box<dyn DebugHook>>,
@@ -100,6 +125,8 @@ impl Interpreter {
     pub fn new(host: impl Host + 'static) -> Self {
         Interpreter {
             procs: HashMap::new(),
+            modules: HashMap::new(),
+            terminate: TerminateQueue::default(),
             classes: HashMap::new(),
             types: HashMap::new(),
             enums: HashMap::new(),
@@ -147,14 +174,26 @@ impl Interpreter {
                 next = value::add(&v, &Value::Long(1))?;
                 let s = slot(v.clone(), VarType::Long);
                 s.borrow_mut().is_const = true;
-                self.globals.push((name.clone(), s));
+                self.globals.push(Global {
+                    name: name.clone(),
+                    slot: s,
+                    module: None,
+                    public: true,
+                });
                 members.push((name.clone(), v));
             }
             self.enums.insert(e.name.to_ascii_lowercase(), members);
         }
         if module.kind == ModuleKind::Class {
             let mut members: HashMap<String, ProcSet> = HashMap::new();
+            let mut default_member = None;
+            let mut enum_member = None;
             for p in module.procedures {
+                match p.user_mem_id {
+                    Some(0) => default_member = Some(p.name.clone()),
+                    Some(-4) => enum_member = Some(p.name.clone()),
+                    _ => {}
+                }
                 members
                     .entry(p.name.to_ascii_lowercase())
                     .or_default()
@@ -177,21 +216,43 @@ impl Interpreter {
                 members,
                 fields,
                 consts,
+                implements: module.implements,
+                events: module.events.into_iter().map(|e| e.name).collect(),
+                default_member,
+                enum_member,
             };
             self.classes
                 .insert(module.name.to_ascii_lowercase(), Rc::new(class));
             return Ok(());
         }
+        self.modules
+            .insert(module.name.to_ascii_lowercase(), info.clone());
         for p in module.procedures {
-            self.procs
-                .insert(p.name.to_ascii_lowercase(), (Rc::new(p), info.clone()));
+            let entries = self.procs.entry(p.name.to_ascii_lowercase()).or_default();
+            match entries.iter_mut().find(|e| Rc::ptr_eq(&e.module, &info)) {
+                Some(e) => e.set.insert(Rc::new(p)),
+                None => {
+                    let mut set = ProcSet::default();
+                    set.insert(Rc::new(p));
+                    entries.push(StdProc {
+                        set,
+                        module: info.clone(),
+                    });
+                }
+            }
         }
         for decl in &module.declarations {
+            let public = decl.visibility == Visibility::Public;
             match &decl.stmt.kind {
                 StmtKind::Dim(vars) => {
                     for v in vars {
                         let s = self.new_var_slot(v)?;
-                        self.globals.push((v.name.clone(), s));
+                        self.globals.push(Global {
+                            name: v.name.clone(),
+                            slot: s,
+                            module: Some(info.clone()),
+                            public,
+                        });
                     }
                 }
                 StmtKind::Const(items) => {
@@ -199,7 +260,12 @@ impl Interpreter {
                         let value = self.eval(e)?;
                         let s = slot(value, VarType::Variant);
                         s.borrow_mut().is_const = true;
-                        self.globals.push((name.clone(), s));
+                        self.globals.push(Global {
+                            name: name.clone(),
+                            slot: s,
+                            module: Some(info.clone()),
+                            public,
+                        });
                     }
                 }
                 _ => {}
@@ -209,34 +275,106 @@ impl Interpreter {
     }
 
     pub fn procedure_names(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.procs.values().map(|(p, _)| p.name.clone()).collect();
+        let mut v: Vec<String> = self
+            .procs
+            .values()
+            .flatten()
+            .filter_map(|e| e.set.for_kind(&Invoke::Get))
+            .map(|p| p.name.clone())
+            .collect();
         v.sort();
+        v.dedup();
         v
     }
 
     pub fn procedure(&self, name: &str) -> Option<Rc<Procedure>> {
-        self.procs
-            .get(&name.to_ascii_lowercase())
-            .map(|(p, _)| p.clone())
+        self.lookup_proc(name)
+            .and_then(|(set, _)| set.for_kind(&Invoke::Get))
+    }
+
+    /// The procedures named `name` as seen from the current module: its own
+    /// first, then the public ones of other modules. Outside any procedure
+    /// (a host calling in) private procedures are reachable too.
+    fn lookup_proc(&self, name: &str) -> Option<(ProcSet, Rc<ModuleInfo>)> {
+        let entries = self.procs.get(&name.to_ascii_lowercase())?;
+        let Some(current) = self.frame().map(|f| f.module.clone()) else {
+            return entries.first().map(|e| (e.set.clone(), e.module.clone()));
+        };
+        if let Some(e) = entries.iter().find(|e| Rc::ptr_eq(&e.module, &current)) {
+            return Some((e.set.clone(), e.module.clone()));
+        }
+        entries.iter().find_map(|e| {
+            let set = e.set.public_only();
+            (!set.is_empty()).then(|| (set, e.module.clone()))
+        })
     }
 
     /// Runs a `Sub` or `Function` by name with the given arguments.
     pub fn run(&mut self, name: &str, args: Vec<Value>) -> VbaResult<Value> {
-        let (proc, module) = self
-            .procs
-            .get(&name.to_ascii_lowercase())
-            .cloned()
-            .ok_or_else(|| VbaError::sub_not_defined(name))?;
         self.frames.clear();
+        let (proc, module) = self
+            .lookup_proc(name)
+            .and_then(|(set, m)| set.for_kind(&Invoke::Method).map(|p| (p, m)))
+            .ok_or_else(|| VbaError::sub_not_defined(name))?;
         let slots = args.into_iter().map(ArgSource::Value).collect();
         let r = self.call_procedure(proc, module, None, slots, Vec::new());
         self.frames.clear();
+        let r = match r {
+            // `End` and Reset discard objects without running Class_Terminate.
+            Err(e) if !e.trappable => {
+                self.discard_terminators();
+                Err(e)
+            }
+            r => {
+                let t = self.run_terminators();
+                r.and_then(|v| t.map(|_| v))
+            }
+        };
         if let Some(line) = self.print_pending.take() {
             self.host.debug_print(&line);
         }
         match r {
             Err(e) if e.is_end() => Ok(Value::Empty),
             other => other,
+        }
+    }
+
+    /// Drops released instances without running `Class_Terminate`. Taken out
+    /// of the queue first: dropping one may release (and queue) others.
+    fn discard_terminators(&mut self) {
+        loop {
+            let pending = std::mem::take(&mut *self.terminate.borrow_mut());
+            if pending.is_empty() {
+                return;
+            }
+            drop(pending);
+        }
+    }
+
+    /// Runs `Class_Terminate` for instances released since the last call.
+    fn run_terminators(&mut self) -> VbaResult<()> {
+        if self.inspecting {
+            return Ok(());
+        }
+        loop {
+            let pending = std::mem::take(&mut *self.terminate.borrow_mut());
+            if pending.is_empty() {
+                return Ok(());
+            }
+            for obj in pending {
+                let inst = obj
+                    .as_any()
+                    .downcast_ref::<ClassInstance>()
+                    .expect("class instance");
+                let class = inst.class.clone();
+                if let Some(p) = class
+                    .members
+                    .get("class_terminate")
+                    .and_then(|m| m.call.clone())
+                {
+                    self.call_procedure(p, class.info.clone(), Some(obj.clone()), vec![], vec![])?;
+                }
+            }
         }
     }
 
@@ -279,7 +417,7 @@ impl Interpreter {
     pub fn module_variables(&self) -> Vec<(String, Value)> {
         self.globals
             .iter()
-            .map(|(n, s)| (n.clone(), s.borrow().value.clone()))
+            .map(|g| (g.name.clone(), g.slot.borrow().value.clone()))
             .collect()
     }
 
@@ -453,8 +591,7 @@ impl Interpreter {
             // Exit Sub / End Sub from a procedure with a handler resets Err.
             self.err.clear();
         }
-        result?;
-        Ok(if returns {
+        let ret = if returns {
             frame
                 .locals
                 .iter()
@@ -464,7 +601,18 @@ impl Interpreter {
                 .unwrap_or(Value::Empty)
         } else {
             Value::Empty
-        })
+        };
+        // Locals go out of scope here; objects they held may terminate.
+        drop(frame);
+        match result {
+            Err(e) if !e.trappable => Err(e),
+            result => {
+                let t = self.run_terminators();
+                result?;
+                t?;
+                Ok(ret)
+            }
+        }
     }
 
     // ---- statements ---------------------------------------------------------
@@ -558,8 +706,14 @@ impl Interpreter {
         } else if let Some(f) = self.frame_mut() {
             f.line = line;
         }
-        self.exec_stmt_kind(&stmt.kind)
-            .map_err(|e| e.with_line(line))
+        let r = match self.exec_stmt_kind(&stmt.kind) {
+            Err(e) if !e.trappable => Err(e),
+            r => {
+                let t = self.run_terminators();
+                r.and_then(|flow| t.map(|_| flow))
+            }
+        };
+        r.map_err(|e| e.with_line(line))
     }
 
     fn exec_stmt_kind(&mut self, kind: &StmtKind) -> VbaResult<Flow> {
@@ -570,7 +724,12 @@ impl Interpreter {
                     let s = self.new_var_slot(v)?;
                     match self.frame_mut() {
                         Some(f) => f.locals.push((v.name.clone(), s)),
-                        None => self.globals.push((v.name.clone(), s)),
+                        None => self.globals.push(Global {
+                            name: v.name.clone(),
+                            slot: s,
+                            module: None,
+                            public: true,
+                        }),
                     }
                 }
             }
@@ -626,6 +785,10 @@ impl Interpreter {
             } => {
                 for (cond, body) in branches {
                     let c = self.eval(cond)?;
+                    let c = match c {
+                        Value::Null => c,
+                        c => self.scalar(c)?,
+                    };
                     if truthy(&c)? {
                         return self.exec_block(body);
                     }
@@ -642,9 +805,14 @@ impl Interpreter {
                 body,
             } => {
                 let start = self.eval(from)?;
-                let end = self.eval(to)?.into_scalar()?;
+                let start = self.scalar(start)?;
+                let end = self.eval(to)?;
+                let end = self.scalar(end)?;
                 let step = match step {
-                    Some(s) => self.eval(s)?.into_scalar()?,
+                    Some(s) => {
+                        let v = self.eval(s)?;
+                        self.scalar(v)?
+                    }
                     None => Value::Integer(1),
                 };
                 let counter = match self.find_slot(var) {
@@ -653,7 +821,7 @@ impl Interpreter {
                 };
                 {
                     let mut c = counter.borrow_mut();
-                    c.value = c.ty.coerce(start.into_scalar()?)?;
+                    c.value = c.ty.coerce(start)?;
                 }
                 let descending = step.to_f64()? < 0.0;
                 loop {
@@ -681,7 +849,7 @@ impl Interpreter {
             } => {
                 let items = match self.eval(collection)? {
                     Value::Array(a) => a.data,
-                    Value::Object(Some(o)) => o.enumerate()?,
+                    Value::Object(Some(o)) => self.enumerate(&o)?,
                     Value::Object(None) => return Err(VbaError::object_not_set()),
                     _ => return Err(VbaError::new(92, "For loop not initialized")),
                 };
@@ -718,7 +886,8 @@ impl Interpreter {
                 cases,
                 else_body,
             } => {
-                let subj = self.eval(subject)?.into_scalar()?;
+                let subj = self.eval(subject)?;
+                let subj = self.scalar(subj)?;
                 let text = self.text_compare();
                 for (clauses, body) in cases {
                     for clause in clauses {
@@ -790,8 +959,97 @@ impl Interpreter {
             StmtKind::Resume(k) => return Ok(Flow::Resume(k.clone())),
             StmtKind::GoTo(l) => return Ok(Flow::GoTo(l.clone())),
             StmtKind::End => return Err(VbaError::end()),
+            StmtKind::RaiseEvent { name, args } => self.raise_event(name, args)?,
         }
         Ok(Flow::Normal)
+    }
+
+    /// `RaiseEvent Name(args)`: calls `field_Name` on every object holding
+    /// this instance in a `WithEvents` field. Arguments are passed ByRef, so
+    /// handlers can answer back (`Cancel = True`).
+    fn raise_event(&mut self, name: &str, args: &[Arg]) -> VbaResult<()> {
+        let me = self
+            .me()
+            .ok_or_else(|| VbaError::new(-1, "RaiseEvent is only valid in a class module"))?;
+        let inst = me
+            .as_any()
+            .downcast_ref::<ClassInstance>()
+            .expect("class instance");
+        if !inst
+            .class
+            .events
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(name))
+        {
+            return Err(VbaError::new(-1, format!("Event not found: {name}")));
+        }
+        // Drop listeners that are gone or no longer point at this object.
+        let still_listening = |sink: &ObjectRef, field: &str| {
+            sink.as_any()
+                .downcast_ref::<ClassInstance>()
+                .and_then(|s| s.field_slot(field))
+                .is_some_and(|(slot, _)| {
+                    matches!(&slot.borrow().value, Value::Object(Some(o)) if same_object(o, &me))
+                })
+        };
+        let listeners: Vec<(ObjectRef, String)> = {
+            let mut list = inst.listeners.borrow_mut();
+            list.retain(|(w, f)| w.upgrade().is_some_and(|s| still_listening(&s, f)));
+            list.iter()
+                .filter_map(|(w, f)| Some((w.upgrade()?, f.clone())))
+                .collect()
+        };
+        for (sink, field) in listeners {
+            let sink_inst = sink
+                .as_any()
+                .downcast_ref::<ClassInstance>()
+                .expect("class instance");
+            let handler = format!("{field}_{name}").to_ascii_lowercase();
+            if let Some(p) = sink_inst
+                .class
+                .members
+                .get(&handler)
+                .and_then(|m| m.call.clone())
+            {
+                let info = sink_inst.class.info.clone();
+                let (positional, named) = self.arg_sources(args)?;
+                self.call_procedure(p, info, Some(sink.clone()), positional, named)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// After `Set field = source` on a `WithEvents` field of `Me`, subscribes
+    /// `Me` to the source's events.
+    fn subscribe_events(&self, name: &str, slot: &Slot) {
+        let Some(me) = self.me() else { return };
+        let Some(inst) = me.as_any().downcast_ref::<ClassInstance>() else {
+            return;
+        };
+        let is_with_events = inst
+            .class
+            .fields
+            .iter()
+            .any(|(_, d)| d.with_events && d.name.eq_ignore_ascii_case(name));
+        if !is_with_events
+            || !inst
+                .field_slot(name)
+                .is_some_and(|(s, _)| Rc::ptr_eq(s, slot))
+        {
+            return;
+        }
+        let Value::Object(Some(src)) = &slot.borrow().value else {
+            return;
+        };
+        if let Some(src) = src.as_any().downcast_ref::<ClassInstance>() {
+            let mut list = src.listeners.borrow_mut();
+            let known = list.iter().any(|(w, f)| {
+                f.eq_ignore_ascii_case(name) && w.upgrade().is_some_and(|s| same_object(&s, &me))
+            });
+            if !known {
+                list.push((Rc::downgrade(&me), name.to_string()));
+            }
+        }
     }
 
     fn loop_cond(&mut self, c: &LoopCond) -> VbaResult<bool> {
@@ -814,6 +1072,10 @@ impl Interpreter {
                             self.print_pending = Some(line).filter(|l| !l.is_empty());
                             return Err(err);
                         }
+                    };
+                    let v = match v {
+                        Value::Null => v,
+                        v => self.scalar(v)?,
                     };
                     line.push_str(&print_text(v)?);
                     open = false;
@@ -869,7 +1131,7 @@ impl Interpreter {
         if let Expr::Ident(name) = callee {
             if name.eq_ignore_ascii_case("stop")
                 && args.is_empty()
-                && !self.procs.contains_key("stop")
+                && self.lookup_proc("stop").is_none()
             {
                 self.with_hook(|h, ctx| h.on_stop(ctx, StopKind::Stop))?;
                 return Ok(Flow::Normal);
@@ -900,10 +1162,42 @@ impl Interpreter {
                 }
             }
         }
-        self.globals
+        self.find_global(name)
+    }
+
+    /// A module-level variable: the current module's own first, then the
+    /// public ones of other modules.
+    fn find_global(&self, name: &str) -> Option<Slot> {
+        let current = self.frame().map(|f| f.module.clone());
+        let mut fallback = None;
+        for g in self
+            .globals
             .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, s)| s.clone())
+            .filter(|g| g.name.eq_ignore_ascii_case(name))
+        {
+            match (&g.module, &current) {
+                (Some(m), Some(c)) if Rc::ptr_eq(m, c) => return Some(g.slot.clone()),
+                _ if g.public || g.module.is_none() || current.is_none() => {
+                    fallback.get_or_insert_with(|| g.slot.clone());
+                }
+                _ => {}
+            }
+        }
+        fallback
+    }
+
+    /// `Dim x As New C` creates its object on first use.
+    fn materialize(&mut self, s: &Slot) -> VbaResult<()> {
+        let class = {
+            let var = s.borrow();
+            match (&var.auto_new, &var.value) {
+                (Some(c), Value::Object(None)) => c.clone(),
+                _ => return Ok(()),
+            }
+        };
+        let obj = self.new_object(&class)?;
+        s.borrow_mut().value = obj;
+        Ok(())
     }
 
     fn explicit(&self) -> bool {
@@ -921,7 +1215,12 @@ impl Interpreter {
         let s = slot(value, VarType::Variant);
         match self.frame_mut() {
             Some(f) => f.locals.push((name.to_string(), s.clone())),
-            None => self.globals.push((name.to_string(), s.clone())),
+            None => self.globals.push(Global {
+                name: name.to_string(),
+                slot: s.clone(),
+                module: None,
+                public: true,
+            }),
         }
         Ok(s)
     }
@@ -931,6 +1230,11 @@ impl Interpreter {
             let bounds = self.eval_bounds(bounds)?;
             let arr = self.new_array(bounds, v.ty.as_ref())?;
             return Ok(slot(Value::Array(Box::new(arr)), VarType::Variant));
+        }
+        if let Some(t) = v.ty.as_ref().filter(|t| t.is_new) {
+            let s = slot(Value::Object(None), VarType::Object);
+            s.borrow_mut().auto_new = Some(t.name.clone());
+            return Ok(s);
         }
         let (ty, value) = self.default_of(v.ty.as_ref())?;
         Ok(slot(value, ty))
@@ -1026,10 +1330,7 @@ impl Interpreter {
             s.borrow_mut().is_const = true;
             fields.push((name.clone(), s, Visibility::Private));
         }
-        let obj: ObjectRef = Rc::new(ClassInstance {
-            class: def.clone(),
-            fields,
-        });
+        let obj: ObjectRef = Rc::new(ClassInstance::new(def.clone(), fields, &self.terminate));
         if let Some(init) = def
             .members
             .get("class_initialize")
@@ -1044,6 +1345,23 @@ impl Interpreter {
             )?;
         }
         Ok(Value::Object(Some(obj)))
+    }
+
+    /// Items for `For Each`. A VBA class enumerates through its member
+    /// marked `VB_UserMemId = -4` (usually `Set NewEnum = mItems.[_NewEnum]`).
+    fn enumerate(&mut self, o: &ObjectRef) -> VbaResult<Vec<Value>> {
+        let Some(inst) = o.as_any().downcast_ref::<ClassInstance>() else {
+            return o.enumerate();
+        };
+        let member = inst
+            .class
+            .enum_member
+            .clone()
+            .ok_or_else(|| VbaError::not_supported("_NewEnum"))?;
+        match self.call_member(o, &member, Invoke::Get, Vec::new(), Vec::new())? {
+            Value::Object(Some(e)) => self.enumerate(&e),
+            _ => Err(VbaError::new(92, "For loop not initialized")),
+        }
     }
 
     fn me(&self) -> Option<ObjectRef> {
@@ -1093,18 +1411,29 @@ impl Interpreter {
                     .map(|i| Rc::ptr_eq(&i.class, &class))
             })
             .unwrap_or(false);
+        // `obj` / `obj(i)`: the member marked `VB_UserMemId = 0`.
+        let member = match (member, &class.default_member) {
+            ("", Some(d)) => d.as_str(),
+            ("", None) => return Err(VbaError::not_supported("(default member)")),
+            (m, _) => m,
+        };
         let visible = |p: &Rc<Procedure>| inside || p.visibility == Visibility::Public;
-        let set = class
+        let mut proc = class
             .members
             .get(&member.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_default();
-        let proc = match &kind {
-            Invoke::Let(_) => set.let_.clone(),
-            Invoke::Set(_) => set.set.clone(),
-            Invoke::Get | Invoke::Method => set.call.clone().or_else(|| set.get.clone()),
-        };
-        if let Some(p) = proc.filter(visible) {
+            .and_then(|set| set.for_kind(&kind))
+            .filter(visible);
+        if proc.is_none() && inst.field_slot(member).is_none() {
+            // `shape.Area` on a class that `Implements IShape`: its `IShape_Area`.
+            proc = class.implements.iter().find_map(|i| {
+                let iface = i.rsplit('.').next().unwrap_or(i);
+                class
+                    .members
+                    .get(&format!("{iface}_{member}").to_ascii_lowercase())
+                    .and_then(|set| set.for_kind(&kind))
+            });
+        }
+        if let Some(p) = proc {
             if let Invoke::Let(v) | Invoke::Set(v) = kind {
                 positional.push(ArgSource::Value(v));
             }
@@ -1242,6 +1571,20 @@ impl Interpreter {
                                     .map(|_| ());
                             }
                         }
+                        // `Total = 5`: a Property Let in a standard module.
+                        if let Some((set, module)) = self.lookup_proc(name) {
+                            if let Some(p) = set.for_kind(&kind(Value::Empty)) {
+                                return self
+                                    .call_procedure(
+                                        p,
+                                        module,
+                                        None,
+                                        vec![ArgSource::Value(v)],
+                                        vec![],
+                                    )
+                                    .map(|_| ());
+                            }
+                        }
                         // `ActiveCell = 5`: a property of the host's global object.
                         if let Some(app) = self.host_global_object() {
                             match app.invoke(name, kind(v.clone()), Args::default()) {
@@ -1252,28 +1595,12 @@ impl Interpreter {
                         self.declare_implicit(name, Value::Empty)?
                     }
                 };
-                let mut var = s.borrow_mut();
-                if var.is_const {
-                    return Err(VbaError::new(-1, "Assignment to constant not permitted"));
-                }
-                if is_set {
-                    if !matches!(var.ty, VarType::Variant | VarType::Object) {
-                        return Err(VbaError::type_mismatch());
-                    }
-                    var.value = v;
-                } else if let Value::Object(Some(o)) = &var.value {
-                    // Let on an object variable assigns its default member.
-                    let o = o.clone();
-                    drop(var);
-                    self.invoke_object(&o, "", Invoke::Let(v.into_scalar()?), Args::default())?;
-                } else if matches!(v, Value::Udt(_)) {
-                    var.value = v;
-                } else {
-                    var.value = var.ty.coerce(v.into_scalar()?)?;
-                }
-                Ok(())
+                self.assign_slot(name, &s, v, is_set)
             }
             Expr::Member(obj, name) => {
+                if let Some(info) = self.module_ref(obj) {
+                    return self.assign_in_module(&info, name, v, is_set);
+                }
                 let base = self.eval(obj)?;
                 if let Value::Udt(_) = base {
                     return self.assign_udt_member(target, v, is_set);
@@ -1349,8 +1676,135 @@ impl Interpreter {
         }
     }
 
+    /// Stores into a variable's slot: `Set` replaces the reference, `Let`
+    /// coerces to the declared type or assigns an object's default member.
+    fn assign_slot(&mut self, name: &str, s: &Slot, v: Value, is_set: bool) -> VbaResult<()> {
+        if !is_set {
+            self.materialize(s)?;
+        }
+        let mut var = s.borrow_mut();
+        if var.is_const {
+            return Err(VbaError::new(-1, "Assignment to constant not permitted"));
+        }
+        if is_set {
+            if !matches!(var.ty, VarType::Variant | VarType::Object) {
+                return Err(VbaError::type_mismatch());
+            }
+            let old = std::mem::replace(&mut var.value, v);
+            drop(var);
+            // The old object may terminate here, after the new one is stored.
+            drop(old);
+            self.subscribe_events(name, s);
+        } else if let Value::Object(Some(o)) = &var.value {
+            // Let on an object variable assigns its default member.
+            let o = o.clone();
+            drop(var);
+            let v = self.scalar(v)?;
+            self.invoke_object(&o, "", Invoke::Let(v), Args::default())?;
+        } else if matches!(v, Value::Udt(_)) {
+            var.value = v;
+        } else {
+            drop(var);
+            let v = self.scalar(v)?;
+            let mut var = s.borrow_mut();
+            var.value = var.ty.coerce(v)?;
+        }
+        Ok(())
+    }
+
     fn host_global_object(&self) -> Option<ObjectRef> {
         self.host.global_object()
+    }
+
+    /// `Module1` in `Module1.Foo`: a standard module name not shadowed by a variable.
+    fn module_ref(&self, e: &Expr) -> Option<Rc<ModuleInfo>> {
+        let Expr::Ident(q) = e else { return None };
+        if self.find_slot(q).is_some() {
+            return None;
+        }
+        self.modules.get(&q.to_ascii_lowercase()).cloned()
+    }
+
+    fn in_module(&self, info: &Rc<ModuleInfo>) -> bool {
+        self.frame().is_none_or(|f| Rc::ptr_eq(&f.module, info))
+    }
+
+    /// A variable of a given module, if visible from here.
+    fn module_global(&self, info: &Rc<ModuleInfo>, name: &str) -> Option<Slot> {
+        let inside = self.in_module(info);
+        self.globals
+            .iter()
+            .find(|g| {
+                g.name.eq_ignore_ascii_case(name)
+                    && g.module.as_ref().is_some_and(|m| Rc::ptr_eq(m, info))
+                    && (inside || g.public)
+            })
+            .map(|g| g.slot.clone())
+    }
+
+    /// The procedures of a given module, if visible from here.
+    fn module_procs(&self, info: &Rc<ModuleInfo>, name: &str) -> Option<ProcSet> {
+        let e = self
+            .procs
+            .get(&name.to_ascii_lowercase())?
+            .iter()
+            .find(|e| Rc::ptr_eq(&e.module, info))?;
+        Some(if self.in_module(info) {
+            e.set.clone()
+        } else {
+            e.set.public_only()
+        })
+    }
+
+    fn member_not_found(member: &str) -> VbaError {
+        VbaError::new(-1, format!("Method or data member not found: {member}"))
+    }
+
+    /// `Module1.Foo(args)` / `Module1.Counter`.
+    fn call_in_module(
+        &mut self,
+        info: &Rc<ModuleInfo>,
+        member: &str,
+        args: &[Arg],
+        kind: Invoke,
+    ) -> VbaResult<Value> {
+        if let Some(s) = self.module_global(info, member) {
+            self.materialize(&s)?;
+            let v = s.borrow().value.clone();
+            return self.index_value(v, args, kind);
+        }
+        let proc = self
+            .module_procs(info, member)
+            .and_then(|set| set.for_kind(&kind))
+            .ok_or_else(|| Self::member_not_found(member))?;
+        let (positional, named) = self.arg_sources(args)?;
+        self.call_procedure(proc, info.clone(), None, positional, named)
+    }
+
+    /// `Module1.Counter = 5`.
+    fn assign_in_module(
+        &mut self,
+        info: &Rc<ModuleInfo>,
+        member: &str,
+        v: Value,
+        is_set: bool,
+    ) -> VbaResult<()> {
+        if self.module_global(info, member).is_some() {
+            // Same rules as a plain variable, resolved inside that module.
+            let s = self.module_global(info, member).expect("slot");
+            return self.assign_slot(member, &s, v, is_set);
+        }
+        let kind = if is_set {
+            Invoke::Set(v.clone())
+        } else {
+            Invoke::Let(v.clone())
+        };
+        let proc = self
+            .module_procs(info, member)
+            .and_then(|set| set.for_kind(&kind))
+            .ok_or_else(|| Self::member_not_found(member))?;
+        self.call_procedure(proc, info.clone(), None, vec![ArgSource::Value(v)], vec![])
+            .map(|_| ())
     }
 
     // ---- expressions --------------------------------------------------------
@@ -1379,7 +1833,10 @@ impl Interpreter {
                         || class
                             .rsplit('.')
                             .next()
-                            .is_some_and(|c| o.type_name().eq_ignore_ascii_case(c)),
+                            .is_some_and(|c| o.type_name().eq_ignore_ascii_case(c))
+                        || o.as_any()
+                            .downcast_ref::<ClassInstance>()
+                            .is_some_and(|i| i.class.implements(class)),
                 ),
                 Value::Object(None) => Value::Boolean(false),
                 _ => return Err(VbaError::object_required()),
@@ -1388,8 +1845,14 @@ impl Interpreter {
                 self.eval_call(e, &[], Invoke::Get)?
             }
             Expr::Index(callee, args) => self.eval_call(callee, args, Invoke::Get)?,
-            Expr::Unary(UnOp::Neg, a) => value::neg(&self.eval(a)?.into_scalar()?)?,
-            Expr::Unary(UnOp::Not, a) => value::not(&self.eval(a)?.into_scalar()?)?,
+            Expr::Unary(UnOp::Neg, a) => {
+                let v = self.eval(a)?;
+                value::neg(&self.scalar(v)?)?
+            }
+            Expr::Unary(UnOp::Not, a) => {
+                let v = self.eval(a)?;
+                value::not(&self.scalar(v)?)?
+            }
             Expr::Binary(op, a, b) => {
                 let (a, b) = (self.eval(a)?, self.eval(b)?);
                 self.binary(*op, a, b)?
@@ -1406,7 +1869,7 @@ impl Interpreter {
                 _ => return Err(VbaError::object_required()),
             }));
         }
-        let (a, b) = (a.into_scalar()?, b.into_scalar()?);
+        let (a, b) = (self.scalar(a)?, self.scalar(b)?);
         let text = self.text_compare();
         Ok(match op {
             BinOp::Add => value::add(&a, &b)?,
@@ -1441,6 +1904,18 @@ impl Interpreter {
             BinOp::Imp => value::logical(|x, y| !x | y, &a, &b)?,
             BinOp::Is => unreachable!(),
         })
+    }
+
+    /// A value as a scalar: objects give their default member, which for a
+    /// VBA class is the procedure marked `VB_UserMemId = 0`.
+    fn scalar(&mut self, v: Value) -> VbaResult<Value> {
+        match v {
+            Value::Object(Some(o)) if o.as_any().is::<ClassInstance>() => {
+                let v = self.call_member(&o, "", Invoke::Get, Vec::new(), Vec::new())?;
+                self.scalar(v)
+            }
+            v => v.into_scalar(),
+        }
     }
 
     fn eval_args(&mut self, args: &[Arg]) -> VbaResult<Args> {
@@ -1489,6 +1964,7 @@ impl Interpreter {
                 if let Some(s) = self.find_slot(name) {
                     // Inside a Function, `Fn(x)` with arguments is a recursive call.
                     if !(current_fn && !args.is_empty()) {
+                        self.materialize(&s)?;
                         if args.is_empty() {
                             return Ok(s.borrow().value.clone());
                         }
@@ -1520,14 +1996,25 @@ impl Interpreter {
                         return self.call_member(&me, name, kind, positional, named);
                     }
                 }
-                if let Some((proc, module)) = self.procs.get(&name.to_ascii_lowercase()).cloned() {
+                if let Some((proc, module)) = self
+                    .lookup_proc(name)
+                    .and_then(|(set, m)| set.for_kind(&Invoke::Get).map(|p| (p, m)))
+                {
                     let (positional, named) = self.arg_sources(args)?;
                     return self.call_procedure(proc, module, None, positional, named);
                 }
                 if name.eq_ignore_ascii_case("err") {
                     return self.index_value(Value::from(self.err.clone()), args, kind);
                 }
-                let evaluated = self.eval_args(args)?;
+                let mut evaluated = self.eval_args(args)?;
+                if !builtins::takes_objects(name) {
+                    // `CStr(obj)`, `Len(obj)`: a class's default member.
+                    for v in evaluated.positional.iter_mut() {
+                        if matches!(v, Value::Object(Some(o)) if o.as_any().is::<ClassInstance>()) {
+                            *v = self.scalar(std::mem::take(v))?;
+                        }
+                    }
+                }
                 let text = self.text_compare();
                 if let Some(r) = builtins::call(name, &evaluated, self.host.as_mut(), text) {
                     return r;
@@ -1561,6 +2048,9 @@ impl Interpreter {
                 Ok(Value::Empty)
             }
             Expr::Member(obj, member) => {
+                if let Some(info) = self.module_ref(obj) {
+                    return self.call_in_module(&info, member, args, kind);
+                }
                 if let Expr::Ident(q) = &**obj {
                     if q.eq_ignore_ascii_case("vba") && self.find_slot(q).is_none() {
                         return self.eval_call(&Expr::Ident(member.clone()), args, kind);
@@ -1640,6 +2130,16 @@ impl Interpreter {
             Value::Object(None) => Err(VbaError::object_not_set()),
             _ => Err(VbaError::type_mismatch()),
         }
+    }
+}
+
+impl Drop for Interpreter {
+    /// Module-level objects die with the interpreter, as on a VBA reset:
+    /// without `Class_Terminate`, and without leaving the queue holding them.
+    fn drop(&mut self) {
+        self.frames.clear();
+        self.globals.clear();
+        self.discard_terminators();
     }
 }
 

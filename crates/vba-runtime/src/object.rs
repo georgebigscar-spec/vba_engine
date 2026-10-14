@@ -163,6 +163,8 @@ impl Object for Collection {
                 self.items.borrow_mut().remove(i);
                 Ok(Value::Empty)
             }
+            // `mItems.[_NewEnum]` in a custom collection class.
+            "_newenum" => Ok(Value::Object(Some(Rc::new(Enumerator(self.enumerate()?))))),
             _ => Err(VbaError::not_supported(member)),
         }
     }
@@ -178,6 +180,27 @@ impl Object for Collection {
             .enumerate()
             .map(|(i, (_, v))| (format!("Item {}", i + 1), v.clone()))
             .collect()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// A snapshot of items returned by `[_NewEnum]`, consumed by `For Each`.
+pub struct Enumerator(pub Vec<Value>);
+
+impl Object for Enumerator {
+    fn type_name(&self) -> &str {
+        "Unknown"
+    }
+
+    fn invoke(&self, member: &str, _kind: Invoke, _args: Args) -> VbaResult<Value> {
+        Err(VbaError::not_supported(member))
+    }
+
+    fn enumerate(&self) -> VbaResult<Vec<Value>> {
+        Ok(self.0.clone())
     }
 
     fn as_any(&self) -> &dyn Any {

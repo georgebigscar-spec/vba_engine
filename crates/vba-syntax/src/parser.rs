@@ -9,11 +9,17 @@ type PResult<T> = Result<T, SyntaxError>;
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    /// `VB_UserMemId` read from `Attribute` lines of the procedure being parsed.
+    user_mem_id: Option<i64>,
 }
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0 }
+        Parser {
+            toks,
+            pos: 0,
+            user_mem_id: None,
+        }
     }
 
     // ---- token helpers -------------------------------------------------
@@ -155,6 +161,8 @@ impl Parser {
             procedures: Vec::new(),
             types: Vec::new(),
             enums: Vec::new(),
+            implements: Vec::new(),
+            events: Vec::new(),
         };
         loop {
             self.skip_separators();
@@ -217,6 +225,17 @@ impl Parser {
                 continue;
             }
             let start = self.span();
+            if self.is_ident("Implements") {
+                self.bump();
+                let mut name = self.member_name()?;
+                while self.eat_op(".") {
+                    name.push('.');
+                    name.push_str(&self.member_name()?);
+                }
+                module.implements.push(name);
+                self.end_stmt()?;
+                continue;
+            }
             // Procedures are public by default, variables private.
             let explicit_vis = if self.eat_kw(Kw::Private) {
                 Some(Visibility::Private)
@@ -235,6 +254,16 @@ impl Parser {
                 let proc =
                     self.parse_procedure(explicit_vis.unwrap_or(Visibility::Public), start)?;
                 module.procedures.push(proc);
+            } else if self.is_ident("Event") && matches!(self.peek_at(1), Tok::Ident(_)) {
+                self.bump();
+                let name = self.ident()?;
+                let params = self.parse_params()?;
+                module.events.push(EventDef {
+                    name,
+                    params,
+                    span: start,
+                });
+                self.end_stmt()?;
             } else if self.is_ident("Type") {
                 self.bump();
                 module.types.push(self.parse_type_def(start)?);
@@ -347,24 +376,14 @@ impl Parser {
             }
         };
         let name = self.ident()?;
-        let mut params = Vec::new();
-        if self.eat_op("(") {
-            if !self.is_op(")") {
-                loop {
-                    params.push(self.parse_param()?);
-                    if !self.eat_op(",") {
-                        break;
-                    }
-                }
-            }
-            self.expect_op(")")?;
-        }
+        let params = self.parse_params()?;
         let return_type = if self.eat_kw(Kw::As) {
             Some(self.parse_type()?)
         } else {
             None
         };
         self.end_stmt()?;
+        self.user_mem_id = None;
         let body = match kind {
             ProcKind::Sub => self.parse_block(&|p| p.at_end_of(Kw::Sub))?,
             ProcKind::Function => self.parse_block(&|p| p.at_end_of(Kw::Function))?,
@@ -383,7 +402,50 @@ impl Parser {
             body,
             span,
             end_line,
+            user_mem_id: self.user_mem_id.take(),
         })
+    }
+
+    /// `(a As Long, Optional b = 1)`, or nothing.
+    fn parse_params(&mut self) -> PResult<Vec<Param>> {
+        let mut params = Vec::new();
+        if self.eat_op("(") {
+            if !self.is_op(")") {
+                loop {
+                    params.push(self.parse_param()?);
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+            }
+            self.expect_op(")")?;
+        }
+        Ok(params)
+    }
+
+    /// `Attribute Item.VB_UserMemId = 0` as exported by the VBA editor.
+    fn at_member_attribute(&self) -> bool {
+        self.is_ident("Attribute")
+            && matches!(self.peek_at(1), Tok::Ident(_))
+            && matches!(self.peek_at(2), Tok::Op("."))
+    }
+
+    fn parse_member_attribute(&mut self) -> PResult<()> {
+        self.pos += 3;
+        let attr = self.member_name()?;
+        self.expect_op("=")?;
+        let value = self.parse_expr()?;
+        if attr.eq_ignore_ascii_case("VB_UserMemId") {
+            self.user_mem_id = match value {
+                Expr::Int(n) => Some(n),
+                Expr::Unary(UnOp::Neg, e) => match *e {
+                    Expr::Int(n) => Some(-n),
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+        Ok(())
     }
 
     fn parse_param(&mut self) -> PResult<Param> {
@@ -439,7 +501,8 @@ impl Parser {
     fn parse_var_decls(&mut self) -> PResult<Vec<VarDecl>> {
         let mut decls = Vec::new();
         loop {
-            if self.is_ident("WithEvents") {
+            let with_events = self.is_ident("WithEvents");
+            if with_events {
                 self.bump();
             }
             let name = self.ident()?;
@@ -467,7 +530,12 @@ impl Parser {
             } else {
                 None
             };
-            decls.push(VarDecl { name, ty, bounds });
+            decls.push(VarDecl {
+                name,
+                with_events,
+                ty,
+                bounds,
+            });
             if !self.eat_op(",") {
                 break;
             }
@@ -503,6 +571,11 @@ impl Parser {
             if matches!(self.peek(), Tok::Eof) {
                 return self.err("unexpected end of file inside block");
             }
+            if self.at_member_attribute() {
+                self.parse_member_attribute()?;
+                self.end_stmt()?;
+                continue;
+            }
             out.push(self.parse_statement()?);
             self.end_stmt()?;
         }
@@ -529,6 +602,18 @@ impl Parser {
         if self.is_ident("Static") {
             self.bump();
             return Ok(StmtKind::Dim(self.parse_var_decls()?));
+        }
+        if self.is_ident("RaiseEvent") && matches!(self.peek_at(1), Tok::Ident(_)) {
+            self.bump();
+            let name = self.ident()?;
+            let args = if self.eat_op("(") {
+                let args = self.parse_args(&|p| p.is_op(")"))?;
+                self.expect_op(")")?;
+                args
+            } else {
+                Vec::new()
+            };
+            return Ok(StmtKind::RaiseEvent { name, args });
         }
         let Tok::Keyword(kw) = *self.peek() else {
             return self.parse_simple_statement();
