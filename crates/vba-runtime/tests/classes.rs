@@ -71,7 +71,11 @@ End Sub
     let out = run_with(&[("Account", ACCOUNT_CLS), ("Module1", main)]).unwrap();
     assert_eq!(
         out,
-        vec!["nobody Account True", "15.5 2 Ann: 15.50", "0 False"]
+        vec![
+            "nobody        Account       True",
+            " 15.5          2            Ann: 15.50",
+            " 0            False"
+        ]
     );
 }
 
@@ -79,7 +83,7 @@ End Sub
 fn class_errors_and_private_members() {
     let main = "Sub Main()\n  Dim a As New Account\n  On Error Resume Next\n  a.Balance = -1\n  Debug.Print Err.Number, Err.Description\n  Err.Clear\n  a.Secret\n  Debug.Print Err.Number\nEnd Sub\n";
     let out = run_with(&[("Account", ACCOUNT_CLS), ("Module1", main)]).unwrap();
-    assert_eq!(out, vec!["5 Negative balance", "438"]);
+    assert_eq!(out, vec![" 5            Negative balance", " 438 "]);
 }
 
 #[test]
@@ -121,7 +125,14 @@ Sub Main()
 End Sub
 "#;
     let out = run_with(&[("Module1", src)]).unwrap();
-    assert_eq!(out, vec!["11 2 100 Point", "box 3 7", "42 0"]);
+    assert_eq!(
+        out,
+        vec![
+            " 11            2             100          Point",
+            "box            3             7 ",
+            " 42            0 "
+        ]
+    );
 }
 
 #[test]
@@ -150,5 +161,11 @@ Sub Main()
 End Sub
 "#;
     let out = run_with(&[("Module1", src)]).unwrap();
-    assert_eq!(out, vec!["0 10 11 Long", "6.5 0"]);
+    assert_eq!(
+        out,
+        vec![
+            " 0             10            11           Long",
+            " 6.5           0 "
+        ]
+    );
 }

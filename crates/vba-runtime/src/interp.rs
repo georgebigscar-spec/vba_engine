@@ -92,6 +92,8 @@ pub struct Interpreter {
     /// Set while the debugger evaluates a watch: unknown names are errors
     /// instead of implicit declarations, so inspection has no side effects.
     inspecting: bool,
+    /// A `Debug.Print` line left open by a trailing `;` or `,`.
+    print_pending: Option<String>,
 }
 
 impl Interpreter {
@@ -108,6 +110,7 @@ impl Interpreter {
             err: Rc::new(ErrObject::default()),
             steps: 0,
             inspecting: false,
+            print_pending: None,
         }
     }
 
@@ -228,6 +231,9 @@ impl Interpreter {
         let slots = args.into_iter().map(ArgSource::Value).collect();
         let r = self.call_procedure(proc, module, None, slots, Vec::new());
         self.frames.clear();
+        if let Some(line) = self.print_pending.take() {
+            self.host.debug_print(&line);
+        }
         match r {
             Err(e) if e.is_end() => Ok(Value::Empty),
             other => other,
@@ -613,6 +619,7 @@ impl Interpreter {
                 self.assign(target, v, true)?;
             }
             StmtKind::Call { callee, args } => return self.exec_call(callee, args),
+            StmtKind::DebugPrint(items) => self.exec_print(items)?,
             StmtKind::If {
                 branches,
                 else_body,
@@ -790,6 +797,41 @@ impl Interpreter {
     fn loop_cond(&mut self, c: &LoopCond) -> VbaResult<bool> {
         let v = self.eval(&c.cond)?;
         Ok(truthy(&v)? != c.until)
+    }
+
+    /// `Debug.Print`: numbers get a sign space before and a space after,
+    /// `;` joins, `,` moves to the next 14-column zone, and a trailing
+    /// separator leaves the line open for the next `Debug.Print`.
+    fn exec_print(&mut self, items: &[PrintItem]) -> VbaResult<()> {
+        let mut line = self.print_pending.take().unwrap_or_default();
+        let mut open = false;
+        for item in items {
+            match item {
+                PrintItem::Expr(e) => {
+                    let v = match self.eval(e) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            self.print_pending = Some(line).filter(|l| !l.is_empty());
+                            return Err(err);
+                        }
+                    };
+                    line.push_str(&print_text(v)?);
+                    open = false;
+                }
+                PrintItem::Semicolon => open = true,
+                PrintItem::Comma => {
+                    let width = line.chars().count();
+                    line.extend(std::iter::repeat_n(' ', (width / 14 + 1) * 14 - width));
+                    open = true;
+                }
+            }
+        }
+        if open {
+            self.print_pending = Some(line);
+        } else {
+            self.host.debug_print(&line);
+        }
+        Ok(())
     }
 
     fn exec_call(&mut self, callee: &Expr, args: &[Arg]) -> VbaResult<Flow> {
@@ -1646,4 +1688,26 @@ fn find_label(stmts: &[Stmt], label: &str) -> Option<usize> {
     stmts
         .iter()
         .position(|s| matches!(&s.kind, StmtKind::Label(l) if l.eq_ignore_ascii_case(label)))
+}
+
+/// How `Print` renders a value.
+fn print_text(v: Value) -> VbaResult<String> {
+    let v = match v {
+        Value::Null => return Ok("Null".into()),
+        v => v.into_scalar()?,
+    };
+    Ok(match v {
+        Value::Boolean(_) | Value::Date(_) | Value::Empty | Value::String(_) | Value::Error(_) => {
+            v.to_string()
+        }
+        v if v.is_numeric_type() => {
+            let s = v.to_string();
+            if s.starts_with('-') {
+                format!("{s} ")
+            } else {
+                format!(" {s} ")
+            }
+        }
+        v => v.to_string(),
+    })
 }

@@ -9,8 +9,9 @@ use crate::object::ObjectRef;
 
 /// A VBA value. Every variable is conceptually a `Variant`; declared types are
 /// enforced by coercing on assignment (see [`VarType::coerce`]).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum Value {
+    #[default]
     Empty,
     Null,
     Boolean(bool),

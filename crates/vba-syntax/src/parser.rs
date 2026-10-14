@@ -666,6 +666,23 @@ impl Parser {
 
     /// Assignment or call statement starting with an expression.
     fn parse_simple_statement(&mut self) -> PResult<StmtKind> {
+        if self.is_ident("debug")
+            && matches!(self.peek_at(1), Tok::Op("."))
+            && matches!(self.peek_at(2), Tok::Ident(w) if w.eq_ignore_ascii_case("print"))
+        {
+            self.pos += 3;
+            let mut items = Vec::new();
+            while !self.at_stmt_end() {
+                items.push(if self.eat_op(";") {
+                    PrintItem::Semicolon
+                } else if self.eat_op(",") {
+                    PrintItem::Comma
+                } else {
+                    PrintItem::Expr(self.parse_expr()?)
+                });
+            }
+            return Ok(StmtKind::DebugPrint(items));
+        }
         let target = self.parse_postfix()?;
         if self.eat_op("=") {
             return Ok(StmtKind::Assign {

@@ -32,6 +32,7 @@
 | `vba-syntax` | Токенизатор (регистронезависимый, `_`-переносы, `'`/`Rem`, `""`, `&H`, `#дата#`, суффиксы типов), рекурсивный парсер, AST со `Span` на каждом операторе. `parse_expression` для watch-выражений. |
 | `vba-runtime` | `Value` (Variant), правила приведения и операторов, `Object`/`Host` — интерфейс объектной модели, стандартная библиотека VBA, интерпретатор, хуки отладчика. |
 | `vba-debug` | `Debugger` поверх `DebugHook`: режимы исполнения, брейкпоинты, watch, перехват ошибок, `ChannelFrontend` для управления из другого потока. |
+| `vba-excel` | Эталонный хост: объектная модель Excel в памяти поверх `Host`/`Object`, чтение и запись `.xlsx`. |
 | `vba-cli` | `vba run Main.bas Class1.cls ...`, `vba debug ...` — консольный отладчик с командами в духе VBE, брейкпоинты вида `Module:line`. |
 
 ## Система типов (`value.rs`)
@@ -164,6 +165,49 @@ Watch: `Expression`, `BreakWhenTrue`, `BreakWhenChanged`, с ограничен�
   переменные `As Color` хранятся как `Long`.
 - **`ParamArray`** собирает оставшиеся аргументы в массив `Variant` с базой 0.
 
+### Мок Excel (`vba-excel`)
+
+`ExcelHost` реализует `Host`: глобальные `Application`, `ActiveWorkbook`,
+`ThisWorkbook`, `ActiveSheet`, `ActiveCell`, `Workbooks`, `Worksheets`,
+`Sheets`, `WorksheetFunction` и ~60 констант `xl*`; `global_object` —
+`Application`, поэтому неквалифицированные `Range("A1")`, `Cells(i, 1)`,
+`Rows.Count` работают как в Excel.
+
+- **Данные** (`model.rs`): лист — разреженный `BTreeMap<(строка, столбец), CellData>`
+  (значение, формула, стиль), числа хранятся как `Double`, как в Excel.
+  `End` повторяет Ctrl+стрелка, `CurrentRegion` и `UsedRange` считаются по
+  заполненным ячейкам. Объекты (`RangeObj`, `WorksheetObj`, ...) — лёгкие
+  ссылки на общие данные, поэтому `Set r = Range("A1")` видит последующие изменения.
+- **Range**: `Value`/`Value2` (скаляр или массив `(1 To n, 1 To m)`, запись
+  скаляра, 1D и 2D массивов), `Formula` (хранится и сохраняется, не вычисляется),
+  `Text` через `NumberFormat`, `Address(RowAbsolute, ColumnAbsolute)`, `Cells`,
+  `Range`, `Rows`, `Columns`, `EntireRow/Column`, `Offset`, `Resize`, `End`,
+  `CurrentRegion`, `Count`, `ClearContents`, `Clear`, `Copy`, `Font.Bold/Italic/Size/Color`,
+  `Interior.Color`, `For Each` по ячейкам, строкам и столбцам.
+- **Листы и книги**: `Worksheets.Add(Before/After/Count)`, `Name`, `Index`,
+  `Delete`, `Activate`, `Workbooks.Add/Open`, `SaveAs`, `Save`, `Close`.
+- **WorksheetFunction**: `Sum`, `Product`, `Average`, `Min`, `Max`, `Large`,
+  `Small`, `Count`, `CountA`, `CountBlank`, `CountIf`, `SumIf`, `AverageIf`
+  (критерии `">5"`, `"<>x"`, подстановочные `*`/`?`), `VLookup`, `HLookup`,
+  `Match`, `Index`, `Round/RoundUp/RoundDown`, `Trim`, `Transpose`. Ошибка —
+  1004 «Unable to get the X property of the WorksheetFunction class», как в Excel.
+- **`.xlsx`** (фича `xlsx`, по умолчанию включена): чтение через `calamine`
+  (значения, формулы, даты), запись через `rust_xlsxwriter` (значения, формулы,
+  жирный/курсив, цвет и размер шрифта, заливка, числовой формат).
+- **CLI**: `--excel` (пустая книга), `--workbook in.xlsx`, `--save out.xlsx`;
+  отладчик работает так же, `? Range("A1").Value` в Immediate.
+
+Ограничения мока: формулы не пересчитываются; стили при чтении `.xlsx` не
+загружаются; формат целых строк/столбцов применяется только к существующим
+ячейкам; `Union` несмежных диапазонов приближается охватывающим прямоугольником;
+нет `Names`, `ListObjects`, `Charts`, событий листа.
+
+### `Debug.Print`
+
+Печать как в VBA: числа с пробелом под знак впереди и пробелом после,
+`;` склеивает, `,` переходит к следующей зоне в 14 символов, завершающий
+`;` или `,` оставляет строку открытой для следующего `Debug.Print`.
+
 ## Известные ограничения и план
 
 1. **Классы, дальше**: `Class_Terminate` (нужен счётчик ссылок с доступом к
@@ -179,8 +223,9 @@ Watch: `Expression`, `BreakWhenTrue`, `BreakWhenChanged`, с ограничен�
 5. **Семантика ближе к VBA**: сравнение Variant-строки с числом,
    локаль для дат/чисел, `Format` целиком, `Decimal`, `Erase`, `LSet/RSet`,
    файловый ввод-вывод (`Open/Print #/Line Input`).
-6. **Хосты**: эталонный мок Excel (`Workbook/Worksheet/Range` поверх
-   `calamine`/`rust_xlsxwriter`), COM-мост на Windows (`IDispatch` через `windows-rs`).
+6. **Хосты**: мок Excel дальше (вычисление формул, `Find`, `Sort`,
+   `AutoFilter`, `Names`), COM-мост на Windows (`IDispatch` через `windows-rs`)
+   для запуска тех же макросов в настоящем Excel.
 7. **Отладочный протокол**: DAP-сервер поверх `ChannelFrontend` для VS Code.
 8. **Совместимость**: корпус реальных макросов + сравнение вывода с настоящим
    Excel (golden-тесты).

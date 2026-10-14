@@ -27,7 +27,7 @@ Sub Main()
     Debug.Print Fact(10)
 End Sub
 "#);
-    assert_eq!(out, vec!["3628800"]);
+    assert_eq!(out, vec![" 3628800 "]);
 }
 
 #[test]
@@ -45,7 +45,7 @@ Sub Main()
     Debug.Print a, b
 End Sub
 "#);
-    assert_eq!(out, vec!["2 0"]);
+    assert_eq!(out, vec![" 2             0 "]);
 }
 
 #[test]
@@ -71,7 +71,10 @@ Sub Main()
     Debug.Print Join(Split("a,b,c", ","), "-"), InStr("hello", "ll")
 End Sub
 "#);
-    assert_eq!(out, vec!["10;7;4;1;", "medium", "HELLO|bcd|3", "a-b-c 3"]);
+    assert_eq!(
+        out,
+        vec!["10;7;4;1;", "medium", "HELLO|bcd|3", "a-b-c          3 "]
+    );
 }
 
 #[test]
@@ -93,7 +96,13 @@ Sub Main()
     Debug.Print c.Count, c("first"), c(2)
 End Sub
 "#);
-    assert_eq!(out, vec!["114 4 1", "2 x y"]);
+    assert_eq!(
+        out,
+        vec![
+            " 114           4             1 ",
+            " 2            x             y"
+        ]
+    );
 }
 
 #[test]
@@ -112,7 +121,14 @@ Handler:
     Resume Next
 End Sub
 "#);
-    assert_eq!(out, vec!["after 11", "handled 1234 custom", "not reached"]);
+    assert_eq!(
+        out,
+        vec![
+            "after          11 ",
+            "handled        1234         custom",
+            "not reached"
+        ]
+    );
 }
 
 #[test]
@@ -159,7 +175,7 @@ End Sub
         )
         .unwrap();
     engine.run("Main", vec![]).unwrap();
-    assert_eq!(host.lines(), vec!["Report Worksheet"]);
+    assert_eq!(host.lines(), vec!["Report        Worksheet"]);
     assert_eq!(sheet.get_prop("Value").unwrap().to_string(), "42");
 }
 
@@ -173,4 +189,29 @@ fn function_called_from_host_with_args() {
         .run("Add", vec![Value::Long(2), Value::Double(0.5)])
         .unwrap();
     assert_eq!(v.to_string(), "2.5");
+}
+
+#[test]
+fn debug_print_separators() {
+    let out = run(r#"
+Sub Main()
+    Dim i As Integer
+    For i = 1 To 3
+        Debug.Print i;
+    Next
+    Debug.Print
+    Debug.Print "a"; "b"; -1.5; True
+    Debug.Print "x", 2, "y"
+    Debug.Print "open";
+End Sub
+"#);
+    assert_eq!(
+        out,
+        vec![
+            " 1  2  3 ",
+            "ab-1.5 True",
+            "x              2            y",
+            "open"
+        ]
+    );
 }

@@ -13,3 +13,4 @@ path = "src/main.rs"
 vba-syntax.workspace = true
 vba-runtime.workspace = true
 vba-debug.workspace = true
+vba-excel.workspace = true
