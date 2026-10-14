@@ -1,4 +1,4 @@
-//! Abstract syntax tree for a VBA standard module.
+//! Abstract syntax tree for VBA standard and class modules.
 //!
 //! Every statement carries a [`Span`] so the runtime and debugger can map
 //! execution back to source lines.
@@ -8,10 +8,48 @@ use crate::Span;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
     pub name: String,
+    pub kind: ModuleKind,
     pub options: ModuleOptions,
     /// Module-level `Dim` / `Private` / `Public` / `Const` declarations.
-    pub declarations: Vec<Stmt>,
+    pub declarations: Vec<Declaration>,
     pub procedures: Vec<Procedure>,
+    pub types: Vec<TypeDef>,
+    pub enums: Vec<EnumDef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModuleKind {
+    /// A standard module (`.bas`).
+    #[default]
+    Standard,
+    /// A class module (`.cls`): each `New` creates an instance.
+    Class,
+}
+
+/// A module-level `Dim` / `Const` statement and its visibility. `Dim` is
+/// private; `Public` / `Global` make it visible outside the module (for a
+/// class: a public field).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Declaration {
+    pub visibility: Visibility,
+    pub stmt: Stmt,
+}
+
+/// `Type Name ... End Type`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDef {
+    pub name: String,
+    pub fields: Vec<VarDecl>,
+    pub span: Span,
+}
+
+/// `Enum Name ... End Enum`. Members without a value continue from the
+/// previous one (starting at 0).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDef {
+    pub name: String,
+    pub members: Vec<(String, Option<Expr>)>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -25,6 +63,9 @@ pub struct ModuleOptions {
 pub enum ProcKind {
     Sub,
     Function,
+    PropertyGet,
+    PropertyLet,
+    PropertySet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +92,8 @@ pub struct Param {
     pub name: String,
     pub by_val: bool,
     pub optional: bool,
+    /// `ParamArray args()`: collects the remaining arguments into an array.
+    pub param_array: bool,
     pub ty: Option<TypeName>,
     pub default: Option<Expr>,
 }
@@ -155,6 +198,7 @@ pub enum CaseClause {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitKind {
     Sub,
+    Property,
     Function,
     For,
     Do,
@@ -198,6 +242,8 @@ pub enum Expr {
     /// `f(a, b)` — call or array index; resolved at runtime like VBA does.
     Index(Box<Expr>, Vec<Arg>),
     New(String),
+    /// `TypeOf obj Is ClassName`
+    TypeOf(Box<Expr>, String),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
 }

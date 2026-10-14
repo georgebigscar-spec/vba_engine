@@ -149,14 +149,37 @@ impl Parser {
     pub fn parse_module(&mut self, name: &str) -> PResult<Module> {
         let mut module = Module {
             name: name.to_string(),
+            kind: ModuleKind::Standard,
             options: ModuleOptions::default(),
             declarations: Vec::new(),
             procedures: Vec::new(),
+            types: Vec::new(),
+            enums: Vec::new(),
         };
         loop {
             self.skip_separators();
             if matches!(self.peek(), Tok::Eof) {
                 break;
+            }
+            // Exported `.cls` header: `VERSION 1.0 CLASS` / `BEGIN ... END`.
+            if self.is_ident("VERSION") {
+                while !matches!(self.peek(), Tok::Newline | Tok::Eof) {
+                    if self.is_ident("CLASS") {
+                        module.kind = ModuleKind::Class;
+                    }
+                    self.bump();
+                }
+                continue;
+            }
+            if self.is_ident("BEGIN") && matches!(self.peek_at(1), Tok::Newline) {
+                while !(self.is_kw(Kw::End) && matches!(self.peek_at(1), Tok::Newline | Tok::Eof)) {
+                    if matches!(self.peek(), Tok::Eof) {
+                        return self.err("unterminated BEGIN block");
+                    }
+                    self.bump();
+                }
+                self.bump();
+                continue;
             }
             if self.is_ident("Attribute") {
                 self.bump();
@@ -194,34 +217,52 @@ impl Parser {
                 continue;
             }
             let start = self.span();
-            let mut visibility = Visibility::Public;
-            if self.eat_kw(Kw::Private) {
-                visibility = Visibility::Private;
-            } else if !self.eat_kw(Kw::Public)
-                && (self.is_ident("Friend") || self.is_ident("Global"))
-            {
+            // Procedures are public by default, variables private.
+            let explicit_vis = if self.eat_kw(Kw::Private) {
+                Some(Visibility::Private)
+            } else if self.eat_kw(Kw::Public) {
+                Some(Visibility::Public)
+            } else if self.is_ident("Global") || self.is_ident("Friend") {
                 self.bump();
-            }
+                Some(Visibility::Public)
+            } else {
+                None
+            };
             if self.is_ident("Static") {
                 self.bump();
             }
-            if self.is_kw(Kw::Sub) || self.is_kw(Kw::Function) {
-                let proc = self.parse_procedure(visibility, start)?;
+            if self.is_kw(Kw::Sub) || self.is_kw(Kw::Function) || self.at_property() {
+                let proc =
+                    self.parse_procedure(explicit_vis.unwrap_or(Visibility::Public), start)?;
                 module.procedures.push(proc);
+            } else if self.is_ident("Type") {
+                self.bump();
+                module.types.push(self.parse_type_def(start)?);
+            } else if self.is_ident("Enum") {
+                self.bump();
+                module.enums.push(self.parse_enum_def(start)?);
+            } else if self.is_ident("Declare") {
+                return self.err("Declare statements are not supported");
             } else if self.eat_kw(Kw::Const) {
                 let c = self.parse_const_list()?;
-                module.declarations.push(Stmt {
-                    kind: c,
-                    span: start,
+                module.declarations.push(Declaration {
+                    visibility: explicit_vis.unwrap_or(Visibility::Private),
+                    stmt: Stmt {
+                        kind: c,
+                        span: start,
+                    },
                 });
                 self.end_stmt()?;
             } else {
                 // `Dim x`, `Private x As Long`, `Public x`
                 self.eat_kw(Kw::Dim);
                 let decls = self.parse_var_decls()?;
-                module.declarations.push(Stmt {
-                    kind: StmtKind::Dim(decls),
-                    span: start,
+                module.declarations.push(Declaration {
+                    visibility: explicit_vis.unwrap_or(Visibility::Private),
+                    stmt: Stmt {
+                        kind: StmtKind::Dim(decls),
+                        span: start,
+                    },
                 });
                 self.end_stmt()?;
             }
@@ -229,12 +270,81 @@ impl Parser {
         Ok(module)
     }
 
+    /// `Property Get|Let|Set` lookahead.
+    fn at_property(&self) -> bool {
+        self.is_ident("Property")
+            && (matches!(self.peek_at(1), Tok::Ident(w) if w.eq_ignore_ascii_case("Get"))
+                || matches!(self.peek_at(1), Tok::Keyword(Kw::Let | Kw::Set)))
+    }
+
+    /// `End <word>` where the word is not a keyword (`End Type`, `End Property`).
+    fn at_end_word(&self, word: &str) -> bool {
+        self.is_kw(Kw::End)
+            && matches!(self.peek_at(1), Tok::Ident(w) if w.eq_ignore_ascii_case(word))
+    }
+
+    fn parse_type_def(&mut self, span: Span) -> PResult<TypeDef> {
+        let name = self.ident()?;
+        self.end_stmt()?;
+        let mut fields = Vec::new();
+        loop {
+            self.skip_separators();
+            if self.at_end_word("Type") {
+                self.bump();
+                self.bump();
+                self.end_stmt()?;
+                return Ok(TypeDef { name, fields, span });
+            }
+            if matches!(self.peek(), Tok::Eof) {
+                return self.err("expected 'End Type'");
+            }
+            fields.extend(self.parse_var_decls()?);
+            self.end_stmt()?;
+        }
+    }
+
+    fn parse_enum_def(&mut self, span: Span) -> PResult<EnumDef> {
+        let name = self.ident()?;
+        self.end_stmt()?;
+        let mut members = Vec::new();
+        loop {
+            self.skip_separators();
+            if self.at_end_word("Enum") {
+                self.bump();
+                self.bump();
+                self.end_stmt()?;
+                return Ok(EnumDef {
+                    name,
+                    members,
+                    span,
+                });
+            }
+            if matches!(self.peek(), Tok::Eof) {
+                return self.err("expected 'End Enum'");
+            }
+            let member = self.member_name()?;
+            let value = if self.eat_op("=") {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            members.push((member, value));
+            self.end_stmt()?;
+        }
+    }
+
     fn parse_procedure(&mut self, visibility: Visibility, span: Span) -> PResult<Procedure> {
         let kind = if self.eat_kw(Kw::Sub) {
             ProcKind::Sub
-        } else {
-            self.bump();
+        } else if self.eat_kw(Kw::Function) {
             ProcKind::Function
+        } else {
+            self.bump(); // Property
+            match self.bump() {
+                Tok::Keyword(Kw::Let) => ProcKind::PropertyLet,
+                Tok::Keyword(Kw::Set) => ProcKind::PropertySet,
+                _ => ProcKind::PropertyGet,
+            }
         };
         let name = self.ident()?;
         let mut params = Vec::new();
@@ -255,12 +365,11 @@ impl Parser {
             None
         };
         self.end_stmt()?;
-        let end_kw = if kind == ProcKind::Sub {
-            Kw::Sub
-        } else {
-            Kw::Function
+        let body = match kind {
+            ProcKind::Sub => self.parse_block(&|p| p.at_end_of(Kw::Sub))?,
+            ProcKind::Function => self.parse_block(&|p| p.at_end_of(Kw::Function))?,
+            _ => self.parse_block(&|p| p.at_end_word("Property"))?,
         };
-        let body = self.parse_block(&|p| p.at_end_of(end_kw))?;
         let end_line = self.span().line;
         self.expect_kw(Kw::End)?;
         self.bump();
@@ -285,7 +394,8 @@ impl Parser {
         } else {
             self.eat_kw(Kw::ByRef);
         }
-        if self.is_ident("ParamArray") {
+        let param_array = self.is_ident("ParamArray");
+        if param_array {
             self.bump();
         }
         let name = self.ident()?;
@@ -306,6 +416,7 @@ impl Parser {
             name,
             by_val,
             optional,
+            param_array,
             ty,
             default,
         })
@@ -498,6 +609,7 @@ impl Parser {
                 let k = match self.bump() {
                     Tok::Keyword(Kw::Sub) => ExitKind::Sub,
                     Tok::Keyword(Kw::Function) => ExitKind::Function,
+                    Tok::Ident(w) if w.eq_ignore_ascii_case("Property") => ExitKind::Property,
                     Tok::Keyword(Kw::For) => ExitKind::For,
                     Tok::Keyword(Kw::Do) => ExitKind::Do,
                     other => {
@@ -899,6 +1011,11 @@ impl Parser {
             Tok::Float(v) => Expr::Float(v),
             Tok::Str(s) => Expr::Str(s),
             Tok::Date(s) => Expr::Date(s),
+            Tok::Ident(s) if s.eq_ignore_ascii_case("TypeOf") => {
+                let e = self.parse_postfix()?;
+                self.expect_kw(Kw::Is)?;
+                Expr::TypeOf(Box::new(e), self.parse_type()?.name)
+            }
             Tok::Ident(s) => Expr::Ident(s),
             Tok::Keyword(Kw::True) => Expr::Bool(true),
             Tok::Keyword(Kw::False) => Expr::Bool(false),

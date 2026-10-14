@@ -32,7 +32,7 @@
 | `vba-syntax` | Токенизатор (регистронезависимый, `_`-переносы, `'`/`Rem`, `""`, `&H`, `#дата#`, суффиксы типов), рекурсивный парсер, AST со `Span` на каждом операторе. `parse_expression` для watch-выражений. |
 | `vba-runtime` | `Value` (Variant), правила приведения и операторов, `Object`/`Host` — интерфейс объектной модели, стандартная библиотека VBA, интерпретатор, хуки отладчика. |
 | `vba-debug` | `Debugger` поверх `DebugHook`: режимы исполнения, брейкпоинты, watch, перехват ошибок, `ChannelFrontend` для управления из другого потока. |
-| `vba-cli` | `vba run file.bas`, `vba debug file.bas` — консольный отладчик с командами в духе VBE. |
+| `vba-cli` | `vba run Main.bas Class1.cls ...`, `vba debug ...` — консольный отладчик с командами в духе VBE, брейкпоинты вида `Module:line`. |
 
 ## Система типов (`value.rs`)
 
@@ -147,12 +147,30 @@ Watch: `Expression`, `BreakWhenTrue`, `BreakWhenChanged`, с ограничен�
 приоритетами VBA, ~100 встроенных функций (строки, математика, преобразования,
 даты, `Format`, `Split/Join`, `MsgBox/InputBox`, `CreateObject`), константы `vb*`.
 
+### Классы, пользовательские типы, перечисления
+
+- **Модули классов** (`.cls`, заголовок `VERSION 1.0 CLASS` распознаётся сам,
+  либо `vba_syntax::parse_class_module`): поля `Public/Private`,
+  `Property Get/Let/Set`, `Sub/Function`, `Me`, `Class_Initialize`,
+  `New` / `Dim x As New Class`, `TypeOf x Is Class`, `TypeName`.
+  Экземпляр — `ClassInstance: Object`; интерпретатор перехватывает вызовы его
+  членов (`call_member`), поэтому методы класса получают `ByRef`-аргументы,
+  а приватные члены недоступны снаружи (ошибка 438). В отладчике шаги заходят
+  в методы класса, в Locals виден `Me` с полями.
+- **`Type ... End Type`**: `Value::Udt` со значимой семантикой (копируется при
+  присваивании), вложенные типы и массивы в полях, массивы UDT,
+  запись `a(i).P.X = 1` и `With a(i) : .X = 1` пишет в саму переменную.
+- **`Enum`**: члены — глобальные константы `Long`, доступны и как `Color.Red`;
+  переменные `As Color` хранятся как `Long`.
+- **`ParamArray`** собирает оставшиеся аргументы в массив `Variant` с базой 0.
+
 ## Известные ограничения и план
 
-1. **Модули классов** (`.cls`): `Property Get/Let/Set`, `Class_Initialize/Terminate`,
-   `Me`, `Implements`, события `WithEvents/RaiseEvent`.
-2. **`Type ... End Type`, `Enum`**, фиксированные строки `String * N`, `ParamArray`
-   (сейчас парсится, но не собирается в массив), `Declare` (Win32 API — через хост).
+1. **Классы, дальше**: `Class_Terminate` (нужен счётчик ссылок с доступом к
+   интерпретатору), `Implements`, события `WithEvents/RaiseEvent`, член по
+   умолчанию (`VB_UserMemId = 0`), `Property` в стандартных модулях.
+   `Dim x As New C` создаёт объект сразу, а не при первом обращении.
+2. Фиксированные строки `String * N`, `Declare` (Win32 API — через хост).
 3. **Модули и видимость**: `Private` пока не изолирует, квалифицированные
    `Module1.Foo`, несколько проектов/ссылок.
 4. **Компиляция в байткод** вместо tree-walking: даст `Set Next Statement`

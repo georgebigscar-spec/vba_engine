@@ -228,3 +228,44 @@ fn channel_frontend_across_threads() {
     requests.send(Request::Resume(Command::Continue)).unwrap();
     assert_eq!(worker.join().unwrap(), vec!["14"]);
 }
+
+#[test]
+fn steps_into_class_methods() {
+    let class = "VERSION 1.0 CLASS\nAttribute VB_Name = \"Counter\"\nPrivate n As Long\nPublic Sub Bump()\n    n = n + 1\nEnd Sub\n";
+    let main =
+        "Sub Main()\n    Dim c As New Counter\n    c.Bump\n    Debug.Print \"done\"\nEnd Sub\n";
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let seen2 = seen.clone();
+    let dbg = Debugger::new(FnFrontend(
+        move |ev: &PauseEvent, s: &mut Session<'_, '_>| {
+            let me = s
+                .locals(0)
+                .into_iter()
+                .find(|(n, _, _)| n == "Me")
+                .map(|(_, v, _)| v);
+            seen2
+                .borrow_mut()
+                .push((ev.location.module.clone(), ev.location.line, me));
+            Command::StepInto
+        },
+    ))
+    .stop_on_entry();
+    let mut engine = Engine::new(CaptureHost::new());
+    engine.load_source(class, "Counter").unwrap();
+    engine.load_source(main, "Module1").unwrap();
+    engine.set_debug_hook(dbg);
+    engine.run("Main", vec![]).unwrap();
+    let seen = seen.borrow();
+    let at: Vec<(&str, u32)> = seen.iter().map(|(m, l, _)| (m.as_str(), *l)).collect();
+    assert_eq!(
+        at,
+        vec![
+            ("Module1", 3),
+            ("Counter", 5),
+            ("Counter", 6),
+            ("Module1", 4),
+            ("Module1", 5)
+        ]
+    );
+    assert_eq!(seen[1].2.as_deref(), Some("<Counter> { n: 0 }"));
+}

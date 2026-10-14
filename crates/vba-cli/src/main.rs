@@ -1,8 +1,8 @@
 //! `vba` — run a VBA module or debug it interactively.
 //!
 //! ```text
-//! vba run   Module1.bas [--entry Main]
-//! vba debug Module1.bas [--entry Main] [--break-on never|unhandled|all]
+//! vba run   Module1.bas [Class1.cls ...] [--entry Main]
+//! vba debug Module1.bas [Class1.cls ...] [--entry Main] [--break-on never|unhandled|all]
 //! ```
 
 use std::io::{self, BufRead, Write};
@@ -19,9 +19,10 @@ Commands (VBE shortcut in brackets):
   n            step over            [Shift+F8]
   o            step out             [Ctrl+Shift+F8]
   c            continue             [F5]
-  r <line>     run to line          [Ctrl+F8]
-  b <line> [if <cond>]  toggle / add conditional breakpoint  [F9]
-  log <line> <message with {expr}>   add a logpoint
+  r <loc>      run to line          [Ctrl+F8]
+  b <loc> [if <cond>]  toggle / add conditional breakpoint  [F9]
+  log <loc> <message with {expr}>   add a logpoint
+               <loc> is a line in the current module, or Module:line
   bl           list breakpoints
   bd <id>      delete breakpoint
   w <expr>     add watch
@@ -36,17 +37,33 @@ Commands (VBE shortcut in brackets):
   q            stop the program     [Reset]";
 
 struct Console {
-    source: Vec<String>,
+    /// Module name and source lines.
+    sources: Vec<(String, Vec<String>)>,
 }
 
 impl Console {
-    fn show_source(&self, line: u32, radius: u32) {
+    fn show_source(&self, module: &str, line: u32, radius: u32) {
+        let Some((_, source)) = self
+            .sources
+            .iter()
+            .find(|(m, _)| m.eq_ignore_ascii_case(module))
+        else {
+            return;
+        };
         let from = line.saturating_sub(radius).max(1);
-        let to = (line + radius).min(self.source.len() as u32);
+        let to = (line + radius).min(source.len() as u32);
         for l in from..=to {
             let marker = if l == line { "=>" } else { "  " };
-            eprintln!("{marker}{l:4} | {}", self.source[(l - 1) as usize]);
+            eprintln!("{marker}{l:4} | {}", source[(l - 1) as usize]);
         }
+    }
+}
+
+/// `12` (current module) or `Module:12`.
+fn parse_loc(text: &str, current: &str) -> Option<(Option<String>, u32)> {
+    match text.trim().split_once(':') {
+        Some((m, l)) => Some((Some(m.trim().to_string()), l.trim().parse().ok()?)),
+        None => Some((Some(current.to_string()), text.trim().parse().ok()?)),
     }
 }
 
@@ -66,7 +83,7 @@ impl Frontend for Console {
             "-- {} [{}:{}] ({why})",
             ev.location.procedure, ev.location.module, ev.location.line
         );
-        self.show_source(ev.location.line, 0);
+        self.show_source(&ev.location.module, ev.location.line, 0);
         for w in &ev.watches {
             match &w.value {
                 Ok(v) => eprintln!(
@@ -94,36 +111,36 @@ impl Frontend for Console {
                 "o" => return Command::StepOut,
                 "c" => return Command::Continue,
                 "q" => return Command::Abort,
-                "r" => match rest.parse() {
-                    Ok(line) => return Command::RunToLine { module: None, line },
-                    Err(_) => eprintln!("usage: r <line>"),
+                "r" => match parse_loc(rest, &ev.location.module) {
+                    Some((module, line)) => return Command::RunToLine { module, line },
+                    None => eprintln!("usage: r <line> | r <Module:line>"),
                 },
                 "b" => {
                     let (line, cond) = rest
                         .split_once(" if ")
                         .map_or((rest, None), |(l, c)| (l, Some(c.trim().to_string())));
-                    match line.trim().parse() {
-                        Ok(line) if cond.is_some() => {
-                            let id = s.state.add_breakpoint(None, line);
+                    match parse_loc(line, &ev.location.module) {
+                        Some((module, line)) if cond.is_some() => {
+                            let id = s.state.add_breakpoint(module.as_deref(), line);
                             s.state.breakpoint_mut(id).unwrap().condition = cond;
                             eprintln!("breakpoint #{id} at line {line}");
                         }
-                        Ok(line) => {
-                            let added = s.state.toggle_breakpoint(None, line);
+                        Some((module, line)) => {
+                            let added = s.state.toggle_breakpoint(module.as_deref(), line);
                             eprintln!(
                                 "breakpoint at line {line} {}",
                                 if added { "set" } else { "cleared" }
                             );
                         }
-                        Err(_) => eprintln!("usage: b <line> [if <condition>]"),
+                        None => eprintln!("usage: b <line> [if <condition>]"),
                     }
                 }
                 "log" => match rest
                     .split_once(' ')
-                    .and_then(|(l, m)| Some((l.parse().ok()?, m)))
+                    .and_then(|(l, m)| Some((parse_loc(l, &ev.location.module)?, m)))
                 {
-                    Some((line, msg)) => {
-                        let id = s.state.add_breakpoint(None, line);
+                    Some(((module, line), msg)) => {
+                        let id = s.state.add_breakpoint(module.as_deref(), line);
                         s.state.breakpoint_mut(id).unwrap().log_message = Some(msg.to_string());
                         eprintln!("logpoint #{id} at line {line}");
                     }
@@ -184,7 +201,7 @@ impl Frontend for Console {
                         eprintln!("  #{i} {}.{} line {}", loc.module, loc.procedure, loc.line);
                     }
                 }
-                "list" => self.show_source(ev.location.line, 5),
+                "list" => self.show_source(&ev.location.module, ev.location.line, 5),
                 "h" | "help" => eprintln!("{HELP}"),
                 other => {
                     // A bare `?expr` (no space) as in the Immediate window.
@@ -205,27 +222,33 @@ impl Frontend for Console {
 
 struct Options {
     debug: bool,
-    file: String,
+    files: Vec<String>,
     entry: String,
     error_break: ErrorBreak,
 }
 
 fn parse_args() -> Result<Options, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: vba <run|debug> <file.bas> [--entry Main] [--break-on never|unhandled|all]";
+    let usage = "usage: vba <run|debug> <file.bas|file.cls>... [--entry Main] [--break-on never|unhandled|all]";
     let debug = match args.first().map(String::as_str) {
         Some("run") => false,
         Some("debug") => true,
         _ => return Err(usage.into()),
     };
-    let file = args.get(1).cloned().ok_or(usage)?;
     let mut opts = Options {
         debug,
-        file,
+        files: Vec::new(),
         entry: "Main".into(),
         error_break: ErrorBreak::Unhandled,
     };
-    let mut i = 2;
+    let mut i = 1;
+    while i < args.len() && !args[i].starts_with("--") {
+        opts.files.push(args[i].clone());
+        i += 1;
+    }
+    if opts.files.is_empty() {
+        return Err(usage.into());
+    }
     while i < args.len() {
         let val = args.get(i + 1).cloned().ok_or(usage)?;
         match args[i].as_str() {
@@ -245,22 +268,39 @@ fn parse_args() -> Result<Options, String> {
 }
 
 fn run(opts: Options) -> Result<(), String> {
-    let source = std::fs::read_to_string(&opts.file).map_err(|e| format!("{}: {e}", opts.file))?;
-    let module_name = std::path::Path::new(&opts.file)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("Module1")
-        .to_string();
     let mut engine = Engine::new(StdHost);
-    engine
-        .load_source(&source, &module_name)
-        .map_err(|e| e.to_string())?;
+    let mut sources = Vec::new();
+    for file in &opts.files {
+        let source = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
+        let path = std::path::Path::new(file);
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Module1");
+        let is_class = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("cls"));
+        let parsed = if is_class {
+            vba_syntax::parse_class_module(&source, stem)
+        } else {
+            vba_syntax::parse_module(&source, stem)
+        };
+        let module = parsed.map_err(|e| format!("{file}: {e}"))?;
+        sources.push((
+            module.name.clone(),
+            source.lines().map(str::to_string).collect(),
+        ));
+        engine
+            .interpreter
+            .load_module(module)
+            .map_err(|e| format!("{file}: {e}"))?;
+    }
     if opts.debug {
-        eprintln!("Debugging {} — type 'help' for commands.", opts.file);
-        let mut dbg = Debugger::new(Console {
-            source: source.lines().map(str::to_string).collect(),
-        })
-        .stop_on_entry();
+        eprintln!(
+            "Debugging {} — type 'help' for commands.",
+            opts.files.join(", ")
+        );
+        let mut dbg = Debugger::new(Console { sources }).stop_on_entry();
         dbg.state.error_break = opts.error_break;
         engine.set_debug_hook(dbg);
     }
