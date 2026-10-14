@@ -39,6 +39,36 @@ pub struct Variable {
 
 pub type Slot = Rc<RefCell<Variable>>;
 
+/// `Len` of a variable of a fixed-size type (or a user-defined type): its
+/// size in bytes. `None` for strings and Variants, whose `Len` is the text's.
+fn storage_len(ty: VarType, value: &Value) -> Option<i32> {
+    match value {
+        Value::Array(_) => return None,
+        Value::Udt(u) => {
+            return Some(
+                u.fields
+                    .iter()
+                    .map(|f| {
+                        storage_len(f.ty, &f.value).unwrap_or(match f.ty {
+                            VarType::Variant => 16,
+                            _ => 4,
+                        })
+                    })
+                    .sum(),
+            )
+        }
+        _ => {}
+    }
+    Some(match ty {
+        VarType::Byte => 1,
+        VarType::Boolean | VarType::Integer => 2,
+        VarType::Long | VarType::Single => 4,
+        VarType::Double | VarType::Currency | VarType::Date | VarType::LongLong => 8,
+        VarType::FixedString(n) => n as i32,
+        _ => return None,
+    })
+}
+
 fn slot(value: Value, ty: VarType) -> Slot {
     Rc::new(RefCell::new(Variable {
         value,
@@ -2114,6 +2144,22 @@ impl Interpreter {
                 }
                 if name.eq_ignore_ascii_case("err") {
                     return self.index_value(Value::from(self.err.clone()), args, kind);
+                }
+                // `Len(x)` of a typed variable is its storage size.
+                if let (
+                    [Arg {
+                        name: None,
+                        value: Some(Expr::Ident(v)),
+                    }],
+                    true,
+                ) = (args, name.eq_ignore_ascii_case("len"))
+                {
+                    if let Some(s) = self.find_slot(v) {
+                        let var = s.borrow();
+                        if let Some(n) = storage_len(var.ty, &var.value) {
+                            return Ok(Value::Long(n));
+                        }
+                    }
                 }
                 let mut evaluated = self.eval_args(args)?;
                 if let Some(r) = self.file_builtin(name, &evaluated) {

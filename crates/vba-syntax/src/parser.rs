@@ -910,7 +910,7 @@ impl Parser {
             let value = self.parse_expr()?;
             // `Mid(s, 2, 3) = "abc"` replaces characters in place.
             if let Expr::Index(callee, args) = &target {
-                if matches!(&**callee, Expr::Ident(n) if n.eq_ignore_ascii_case("mid"))
+                if matches!(&**callee, Expr::Ident(n) if n.eq_ignore_ascii_case("mid") || n.eq_ignore_ascii_case("mid$"))
                     && (2..=3).contains(&args.len())
                     && args.iter().all(|a| a.name.is_none() && a.value.is_some())
                 {
