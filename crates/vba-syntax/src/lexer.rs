@@ -443,6 +443,8 @@ pub fn keeps_dollar(word: &str) -> bool {
     matches!(
         word.to_ascii_lowercase().as_str(),
         "left"
+            | "date"
+            | "time"
             | "right"
             | "mid"
             | "ucase"
