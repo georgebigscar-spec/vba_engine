@@ -100,6 +100,9 @@ pub struct Procedure {
     /// `Attribute Name.VB_UserMemId = n` inside the body: 0 marks the default
     /// member, -4 the `For Each` enumerator.
     pub user_mem_id: Option<i64>,
+    /// `Static Sub` / `Static Function`: every local keeps its value
+    /// between calls.
+    pub is_static: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +123,8 @@ pub struct TypeName {
     pub is_new: bool,
     /// `String * 10`: the length of a fixed-length string.
     pub fixed_len: Option<Box<Expr>>,
+    /// `Function F() As Long()`: a dynamic array of this type.
+    pub array: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,6 +156,8 @@ pub struct Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
     Dim(Vec<VarDecl>),
+    /// `Static x As Long`: a local that keeps its value between calls.
+    Static(Vec<VarDecl>),
     Const(Vec<(String, Expr)>),
     ReDim {
         preserve: bool,
@@ -209,6 +216,18 @@ pub enum StmtKind {
     OnError(OnError),
     Resume(ResumeKind),
     GoTo(String),
+    /// `GoSub Label`: jumps to a label of the procedure; `Return` comes back.
+    GoSub(String),
+    Return,
+    /// `On n GoTo a, b` / `On n GoSub a, b`: jumps to the n-th label.
+    OnGoTo {
+        index: Expr,
+        labels: Vec<String>,
+        gosub: bool,
+    },
+    /// `Error n`: raises run-time error n with its standard description.
+    Error(Expr),
+    /// `Name:` or a line number (`100 x = 1`).
     Label(String),
     /// `End` — terminates the program.
     End,
@@ -337,6 +356,8 @@ pub enum Expr {
     /// `TypeOf obj Is ClassName`
     TypeOf(Box<Expr>, String),
     Unary(UnOp, Box<Expr>),
+    /// `(e)`: a parenthesised argument is passed by value.
+    Paren(Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
 }
 

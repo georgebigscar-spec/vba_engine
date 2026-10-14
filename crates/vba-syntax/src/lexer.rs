@@ -174,6 +174,15 @@ fn looks_like_date(rest: &[char]) -> bool {
             .all(|&c| c.is_alphanumeric() || matches!(c, '/' | ':' | '-' | ' ' | ',' | '.'))
 }
 
+/// `word` with the type suffix `last` (the character that ended the
+/// identifier) appended, unless it is not a suffix or already there.
+fn with_suffix(mut word: String, last: char) -> String {
+    if matches!(last, '$' | '%' | '#' | '@') && !word.ends_with(last) {
+        word.push(last);
+    }
+    word
+}
+
 pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
     let chars: Vec<char> = src.chars().collect();
     let mut out = Vec::new();
@@ -406,7 +415,9 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
                 }
                 match Kw::lookup(&word) {
                     Some(kw) => push!(Tok::Keyword(kw), sl, sc),
-                    None => push!(Tok::Ident(word), sl, sc),
+                    // The suffix goes to the parser, which reads it in
+                    // declarations (`Dim h$`) and strips it from the name.
+                    None => push!(Tok::Ident(with_suffix(word, chars[i - 1])), sl, sc),
                 }
             }
             _ => {
