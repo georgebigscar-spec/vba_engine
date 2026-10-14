@@ -11,6 +11,9 @@ pub enum Tok {
     Keyword(Kw),
     Int(i64),
     Float(f64),
+    /// A numeric literal whose type is fixed by a suffix (`%&^!#@`) or by
+    /// hex/octal notation; the char is the suffix.
+    Typed(f64, char),
     Str(String),
     Date(String),
     Op(&'static str),
@@ -307,12 +310,25 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
                 let v = i64::from_str_radix(&digits, radix).map_err(|_| {
                     SyntaxError::new("invalid radix literal", Span { line: sl, col: sc })
                 })?;
-                if matches!(chars.get(j), Some('&' | '%')) {
-                    j += 1;
-                }
+                // `&HFFFF` is Integer -1 and `&HFFFFFFFF` Long -1: radix
+                // literals wrap to the smallest type that holds their bits.
+                let suffix = match chars.get(j) {
+                    Some(&c @ ('%' | '&' | '^')) => {
+                        j += 1;
+                        c
+                    }
+                    _ if v <= 0xFFFF => '%',
+                    _ if v <= 0xFFFF_FFFF => '&',
+                    _ => '^',
+                };
+                let v = match suffix {
+                    '%' => v as u16 as i16 as f64,
+                    '&' => v as u32 as i32 as f64,
+                    _ => v as f64,
+                };
                 col += (j - i) as u32;
                 i = j;
-                push!(Tok::Int(v), sl, sc);
+                push!(Tok::Typed(v, suffix), sl, sc);
             }
             c if c.is_ascii_digit()
                 || (c == '.' && chars.get(i + 1).is_some_and(|d| d.is_ascii_digit())) =>
@@ -338,15 +354,20 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
                 }
                 let text: String = chars[i..j].iter().collect();
                 // Type suffixes: % & ^ (integral) and ! # @ (floating).
-                match chars.get(j) {
-                    Some('!' | '#' | '@') => {
-                        is_float = true;
-                        j += 1;
-                    }
-                    Some('%' | '&' | '^') if !is_float => j += 1,
-                    _ => {}
-                }
-                let tok = if is_float {
+                let suffix = match chars.get(j) {
+                    Some(&c @ ('!' | '#' | '@')) => Some(c),
+                    Some(&c @ ('%' | '&' | '^')) if !is_float => Some(c),
+                    _ => None,
+                };
+                let tok = if let Some(c) = suffix {
+                    j += 1;
+                    Tok::Typed(
+                        text.parse().map_err(|_| {
+                            SyntaxError::new("invalid number", Span { line: sl, col: sc })
+                        })?,
+                        c,
+                    )
+                } else if is_float {
                     Tok::Float(text.parse().map_err(|_| {
                         SyntaxError::new("invalid number", Span { line: sl, col: sc })
                     })?)
@@ -444,7 +465,10 @@ mod tests {
     #[test]
     fn keywords_are_case_insensitive() {
         assert_eq!(toks("DIM")[0], Tok::Keyword(Kw::Dim));
-        assert_eq!(toks("&HFF")[0], Tok::Int(255));
+        assert_eq!(toks("&HFF")[0], Tok::Typed(255.0, '%'));
+        assert_eq!(toks("&HFFFF")[0], Tok::Typed(-1.0, '%'));
+        assert_eq!(toks("&HFFFF&")[0], Tok::Typed(65535.0, '&'));
+        assert_eq!(toks("2@")[0], Tok::Typed(2.0, '@'));
         assert_eq!(toks("1.5E2")[0], Tok::Float(150.0));
     }
 }

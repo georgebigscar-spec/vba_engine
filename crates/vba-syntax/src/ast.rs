@@ -318,6 +318,9 @@ pub struct Arg {
 pub enum Expr {
     Int(i64),
     Float(f64),
+    /// Literal with an explicit type: `%` Integer, `&` Long, `^` LongLong,
+    /// `!` Single, `#` Double, `@` Currency.
+    Typed(f64, char),
     Str(String),
     Date(String),
     Bool(bool),

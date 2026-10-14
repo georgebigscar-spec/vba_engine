@@ -1261,6 +1261,7 @@ impl Parser {
         Ok(match self.bump() {
             Tok::Int(v) => Expr::Int(v),
             Tok::Float(v) => Expr::Float(v),
+            Tok::Typed(v, c) => Expr::Typed(v, c),
             Tok::Str(s) => Expr::Str(s),
             Tok::Date(s) => Expr::Date(s),
             Tok::Ident(s) if s.eq_ignore_ascii_case("TypeOf") => {
@@ -1303,7 +1304,7 @@ fn describe(t: &Tok) -> String {
         Tok::Ident(s) => format!("identifier '{s}'"),
         Tok::Keyword(k) => format!("keyword '{k:?}'"),
         Tok::Int(v) => format!("number {v}"),
-        Tok::Float(v) => format!("number {v}"),
+        Tok::Float(v) | Tok::Typed(v, _) => format!("number {v}"),
         Tok::Str(s) => format!("string \"{s}\""),
         Tok::Date(s) => format!("date #{s}#"),
         Tok::Op(o) => format!("'{o}'"),

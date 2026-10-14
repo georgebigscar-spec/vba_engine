@@ -1918,6 +1918,14 @@ impl Interpreter {
                 v => Value::Double(v as f64),
             },
             Expr::Float(v) => Value::Double(*v),
+            Expr::Typed(v, suffix) => match suffix {
+                '%' => Value::Integer(*v as i16),
+                '&' => Value::Long(*v as i32),
+                '^' => Value::LongLong(*v as i64),
+                '!' => Value::Single(*v as f32),
+                '@' => Value::Currency((*v * 10_000.0).round() as i64),
+                _ => Value::Double(*v),
+            },
             Expr::Str(s) => Value::String(s.clone()),
             Expr::Date(s) => {
                 Value::Date(crate::date::parse_date(s).ok_or_else(VbaError::type_mismatch)?)
